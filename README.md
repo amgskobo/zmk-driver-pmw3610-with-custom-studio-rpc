@@ -1,7 +1,10 @@
 # zmk-driver-pmw3610-with-custom-studio-rpc
 
-![ZMK Version](https://img.shields.io/badge/ZMK-master-blue)
-[![Test](https://github.com/cormoran/zmk-module-template/actions/workflows/zmk-module.yml/badge.svg?branch=main)](https://github.com/cormoran/zmk-module-template/actions/workflows/zmk-module.yml) [![Devcontainer](https://github.com/cormoran/zmk-module-template/actions/workflows/devcontainer.yml/badge.svg?branch=main)](https://github.com/cormoran/zmk-module-template/actions/workflows/devcontainer.yml)
+Maintenance fork of [cormoran/zmk-driver-pmw3610-with-custom-studio-rpc](https://github.com/cormoran/zmk-driver-pmw3610-with-custom-studio-rpc).
+The source baseline is `5c34ea0eec246a1c986111417cd779b53144629a`.
+Firmware, protocol and existing test assertions are retained. Validation must
+identify the selected source and dependencies; physical sensor, split, timing
+and transport acceptance require a separate matching hardware check.
 
 ZMK module providing the [PMW3610](https://github.com/cormoran/zmk-pmw3610-driver)
 optical mouse sensor driver, with a Web UI and an **unofficial** custom ZMK
@@ -79,11 +82,10 @@ This module currently includes (Phase A through Phase E):
   including pure-function tests for frame chunk reassembly/streaming
   assembly).
 
-Phase D (hardware validation) is complete: the frame-capture procedure
-follows the official PMW3610 datasheet (R2.4) `Pixel_Grab` sequence and has
-been validated against a real sensor (see "Frame capture" below). Phase E
-secures the whole subsystem and replaces the web UI's client-driven
-streaming loop with firmware-pushed notifications (see "Security" above and
+The frame-capture procedure implements the PMW3610 `Pixel_Grab` sequence
+described below. This fork does not publish individual hardware histories or
+claim a new physical validation. The secured subsystem replaces the web UI's
+client-driven streaming loop with firmware-pushed notifications (see "Security" above and
 "Frame capture" below).
 
 ## More Info
@@ -233,10 +235,9 @@ Frame capture uses one of two procedures depending on the sensor's wiring
 - **4-wire burst (`FRAME_GRAB`, the default and recommended path).** One
   CS-held burst SPI transaction reads the whole pixel array via `MOTION_BURST`
   (0x12), the same primitive regular burst motion reporting uses -- see
-  `docs/pmw3610.md`'s "Frame Capture burst" section. This is fast: **~72 fps
-  streaming, measured on hardware** (the read itself is ~2 ms; the per-frame
-  cost is dominated by the post-arm fresh-frame wait, tunable — see
-  `max_invalid_retries` below). It is what `CaptureFrame`/`SetFrameStream` use
+  `docs/pmw3610.md`'s "Frame Capture burst" section. The post-arm fresh-frame
+  wait is tunable through `max_invalid_retries` below. It is what
+  `CaptureFrame`/`SetFrameStream` use
   unless the sensor node has `disable-burst-read`. (The read is issued as
   ≤240-byte sub-transfers within the single CS-held transaction to stay under
   the nRF SPIM 255-byte EasyDMA per-transfer cap — see `docs/pmw3610.md`.)
@@ -246,9 +247,8 @@ Frame capture uses one of two procedures depending on the sensor's wiring
   clock on, `PIXEL_GRAB` (0x35) = 0x01), then per pixel: wait for
   `OBSERVATION1` (0x2D) bit2, read `PIXEL_GRAB`, write `OBSERVATION1` = 0x01
   to advance. `PRBS_TEST_CTL` (0x47) bit0 afterwards reports whether the
-  sensor considers all 484 pixels read. This is slow (~2 seconds for a full
-  484-pixel frame, measured on real hardware) since each pixel blocks on a
-  sensor-side handshake -- it exists purely as a correctness fallback for
+  sensor considers all 484 pixels read. Each pixel waits on a sensor-side
+  handshake; this path exists as a correctness fallback for
   wiring that can't hold chip-select across a burst transfer, not as a
   performance target.
 
@@ -263,8 +263,8 @@ The full pixel array is 22x22 = 484 pixels (datasheet Figure 17) either way.
   proto for details): on the 3-wire fallback it is the per-pixel budget of
   10ms ready-bit-wait retries (default 3, clamped 1..100); on the burst path
   it is reinterpreted as the **post-arm wait in ms** — the primary
-  fps/reliability knob (default 5 ms ≈ 72 fps; ~4 ms ≈ 78 fps is the
-  hardware-measured coherent floor, and ≤3 ms starts streaming stale frames).
+  fresh-frame wait, default 5 ms. Actual coherent frame rate and a safe minimum
+  wait depend on the selected hardware and need a matching measurement.
   `complete` mirrors the sensor's own all-pixels-read status (burst: whether
   the burst SPI transaction itself succeeded; fallback: the datasheet's
   all-484 status bit); `duration_ms` is the wall-clock capture duration.
@@ -334,15 +334,11 @@ on its own:
   — enabling streaming while a one-shot capture is somehow still in
   progress is not possible (`CaptureFrame` is synchronous), and
   `CaptureFrame` rejects while streaming is on (see above).
-- Not resetting between frames (rather than a full power-up-reset +
-  reconfigure after every single frame, which is what the one-shot
-  `CaptureFrame` still does) is the dominant streaming speed win: on the
-  4-wire burst path this brings streaming from well under 1 fps to **~72 fps
-  (measured on hardware; ~180× the old per-pixel path)**, tunable up to ~78
-  fps via `max_invalid_retries` (see "Frame capture" above). The 3-wire
-  fallback's `Pixel_Grab` procedure itself is unchanged and still takes
-  roughly 2 seconds per 484-pixel frame — streaming over 3-wire is a
-  correctness fallback, not a performance target.
+- Streaming retains one capture session instead of resetting and reconfiguring
+  after every frame. One-shot `CaptureFrame` still resets on return.
+  The 3-wire fallback retains its per-pixel `Pixel_Grab` procedure. Compare
+  frame integrity, motion recovery and timing on the actual selected sensor
+  before making a throughput or reliability claim.
 - If Studio locks while a stream is running, the firmware stops it after
   the current in-flight capture (a listener on the core lock-state event
   sets the internal "streaming active" flag to false, which also ends the
@@ -642,4 +638,4 @@ Actions for github copilot and claude are available.
 
 - Mention `@copilot`
 - Setup `ANTHROPIC_API_KEY` secret and mention `@claude`
-  - Or fix [claude.yml](./github/workflows/claude.yml) to use `CLAUDE_CODE_OAUTH_TOKEN`
+  - Or fix [claude.yml](./.github/workflows/claude.yml) to use `CLAUDE_CODE_OAUTH_TOKEN`

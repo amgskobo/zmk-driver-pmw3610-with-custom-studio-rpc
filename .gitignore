@@ -9,3 +9,9 @@ _codeql_detected_source_root
 .west
 *.local.json
 .claude/worktrees
+# Local deployment configuration and credentials
+.env
+.env.*
+!.env.example
+*.key
+*.pem
