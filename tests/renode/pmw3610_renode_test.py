@@ -17,7 +17,8 @@ The sensor exposes Renode-monitor test hooks (QueueMotion, PendingMotionCount,
 PowerUpResetCount, ...) so the test can inject motion and inspect what the
 firmware wrote, entirely over the monitor socket.
 
-Wiring: run via `west zmk-renode-test tests/renode --elf <ELF> --skip-smoke`
+Prepare and run through `tools/renode_core.py` as described in README.md.
+It invokes `west zmk-renode-test tests/renode --elf <ELF> --skip-smoke`
 (the default smoke test uses a sensor-less platform, so skip it here), which
 sets ZMK_RENODE_ELF and puts `renode_harness` (zmk-west-commands'
 scripts/lib/renode) on PYTHONPATH. Build the ELF first with

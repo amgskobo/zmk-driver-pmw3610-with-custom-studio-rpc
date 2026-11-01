@@ -1,4 +1,4 @@
-FROM docker.io/zmkfirmware/zmk-dev-arm:4.1
+FROM docker.io/zmkfirmware/zmk-dev-arm:4.1@sha256:77b62cbc6c62ca0026ed9eb511dd7fc2a13692d1b9ddbaf92bca510612390db8
 
 RUN apt update && apt install -y --no-install-recommends \
     gh \
@@ -13,7 +13,7 @@ RUN echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc
 RUN npm install -g @openai/codex @github/copilot
 
 # Install pre-commit
-RUN pip3 install pre-commit --break-system-packages
+RUN pip3 install pre-commit==4.7.0 --break-system-packages
 
 ARG GIT_DELTA_VERSION=0.18.2
 RUN ARCH=$(dpkg --print-architecture) && \
@@ -21,8 +21,7 @@ RUN ARCH=$(dpkg --print-architecture) && \
     dpkg -i "git-delta_${GIT_DELTA_VERSION}_${ARCH}.deb" && \
     rm "git-delta_${GIT_DELTA_VERSION}_${ARCH}.deb"
 
-# I'm living in Japan!
-ENV TZ="Asia/Tokyo"
+ENV TZ="UTC"
 ENV DEVCONTAINER=true
 
 RUN git config --global --add safe.directory /workspace

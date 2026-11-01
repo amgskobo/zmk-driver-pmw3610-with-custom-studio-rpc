@@ -50,7 +50,10 @@ Frame-streaming *notifications* (see "Frame capture" below) are not
 gated by lock state at the transport level, only the RPC call that
 starts/stops a stream is secured — a stream already running keeps emitting
 notifications through a later auto-lock unless something stops it, so the
-firmware itself force-stops any active stream when Studio locks.
+firmware itself retires the local stream and broadcasts a stop to split
+peripherals when Studio locks. The central also discards queued and late
+peripheral data from the retired session. A later unlock alone does not
+resume forwarding images; start a new stream explicitly.
 
 ## Summary
 
@@ -100,22 +103,29 @@ For more info on modules, you can read through through the [Zephyr modules page]
    manifest:
        remotes:
            ...
+           - name: amgskobo
+             url-base: https://github.com/amgskobo
            - name: cormoran
-           url-base: https://github.com/cormoran
+             url-base: https://github.com/cormoran
        projects:
            ...
            - name: zmk-driver-pmw3610-with-custom-studio-rpc
-           remote: cormoran
-           revision: main+custom-studio-protocol # or latest commit hash
+           remote: amgskobo
+           revision: d9d917f16cf830d6abf87877f18d85fce880ac75
            import: true
            ...
            # Required: patched ZMK with custom Studio RPC support
            - name: zmk
            remote: cormoran
-           revision: main+custom-studio-protocol
+           revision: e5c9b6915b56801193e359dd9bad4a167ce0d1b8
            import:
                file: app/west.yml
    ```
+
+   The module's continuation branch is `codex/pmw3610-driver-review`.
+   Select an explicitly reviewed commit when updating this example. Local
+   uncommitted changes require a local source override and are not included
+   in the committed revision above.
 
 2. Add the sensor to your board/shield overlay (see
    `tests/zmk-config/snippets/pmw3610-trackball/pmw3610-trackball.overlay` for
@@ -235,12 +245,12 @@ Frame capture uses one of two procedures depending on the sensor's wiring
 - **4-wire burst (`FRAME_GRAB`, the default and recommended path).** One
   CS-held burst SPI transaction reads the whole pixel array via `MOTION_BURST`
   (0x12), the same primitive regular burst motion reporting uses -- see
-  `docs/pmw3610.md`'s "Frame Capture burst" section. The post-arm fresh-frame
+  DESIGN.md's "G.1 Burst frame capture" section. The post-arm fresh-frame
   wait is tunable through `max_invalid_retries` below. It is what
   `CaptureFrame`/`SetFrameStream` use
   unless the sensor node has `disable-burst-read`. (The read is issued as
   ≤240-byte sub-transfers within the single CS-held transaction to stay under
-  the nRF SPIM 255-byte EasyDMA per-transfer cap — see `docs/pmw3610.md`.)
+  the nRF SPIM 255-byte EasyDMA per-transfer cap.)
 - **3-wire fallback (`Pixel_Grab`, `disable-burst-read` only).** The
   official PMW3610 datasheet (R2.4) `Pixel_Grab` procedure: an arm sequence
   (SPI clock request on, page-1 magic enable, SPI clock request off, test
@@ -329,22 +339,26 @@ on its own:
   clamped semantics as `CaptureFrame` (on the burst path `max_invalid_retries`
   is the post-arm-wait / fps knob; on the 3-wire fallback it is the per-pixel
   retry budget).
+  While a session is active, repeating the same options is idempotent;
+  changing the device or capture options requires stopping first. A new
+  start can return a busy error while the previous capture is finishing;
+  retry after cleanup has restored navigation.
 - `SetFrameStream` and `CaptureFrame`/`GetFrameChunk` share the same
   firmware-side static buffer/`frame_id` counter, so only one can be active
-  — enabling streaming while a one-shot capture is somehow still in
-  progress is not possible (`CaptureFrame` is synchronous), and
-  `CaptureFrame` rejects while streaming is on (see above).
+  — a mutex excludes overlapping sensor captures and frame-buffer access.
+  `CaptureFrame` rejects while a stream is active or still stopping.
 - Streaming retains one capture session instead of resetting and reconfiguring
   after every frame. One-shot `CaptureFrame` still resets on return.
   The 3-wire fallback retains its per-pixel `Pixel_Grab` procedure. Compare
   frame integrity, motion recovery and timing on the actual selected sensor
   before making a throughput or reliability claim.
-- If Studio locks while a stream is running, the firmware stops it after
-  the current in-flight capture (a listener on the core lock-state event
-  sets the internal "streaming active" flag to false, which also ends the
-  capture session/resets the sensor on the same workqueue) — see "Security"
-  above. Notifications themselves are not lock-gated at the transport
-  level, only the `SetFrameStream` call that starts/stops a stream is.
+- If Studio locks while a stream is running, the current sensor read may
+  finish, but the module stops emitting its remaining chunks and ends the
+  owned session. For a split stream, a separate stop control retires the
+  peripheral's queued requests even when its request queue is full. Stop
+  transport failures get bounded retries; the central stops forwarding
+  immediately even if that control cannot be delivered. A split disconnect
+  also retires pending requests and the local capture session.
 - The web UI's frame viewer uses this instead of a client poll loop — see
   [web/README.md](./web/README.md#frame-viewer-notes).
 
@@ -405,6 +419,13 @@ targets local devices, `1` the first peripheral. Since relaying is
 inherently asynchronous, a relayed request's RPC call returns immediately
 with a `DeferredResponse{request_id}`; the real answer arrives later as a
 `PeripheralResponse{source, request_id, response}` Studio notification.
+
+Requests, responses and image chunks use bounded FIFO queues on the receiving
+half. `CONFIG_ZMK_PMW3610_RELAY_QUEUE_DEPTH` defaults to 8 packets per queue
+(range 4–32). A full queue drops the incoming packet with a warning; it does
+not overwrite an accepted packet. A dropped response times out at the client,
+and a dropped chunk leaves an incomplete frame. The lock stop control bypasses
+these queues. Both halves must run this module revision for that control.
 
 ```jsonc
 // GetInfo targeting the first split peripheral's own devices
@@ -476,13 +497,38 @@ calls always target `source: 0` (local devices).
 
 ### Publishing Web UI
 
-**GitHub Pages**: Merge a pull request into `main+custom-studio-protocol` to deploy to `https://<account>.github.io/<repo>/`.
+**GitHub Pages**: A push to `main` builds and deploys to `https://<account>.github.io/<repo>/`.
+Pushes to `codex/pmw3610-driver-review` run Web checks and upload the build
+artifact without deploying it.
 
 **Cloudflare Workers (PR previews)**: Configure `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID` secrets.
 
 ## Module Development Guide
 
 ### Setup for running test
+
+Run dependency preparation, test commands and builds inside Docker. The
+development container below provides the toolchain. Keep dependency
+checkouts, package environments, build outputs and caches in container
+images or named volumes; the workspace commands below run inside that
+container.
+
+The standalone manifests pin Custom Settings to the maintenance fork's
+`codex/custom-settings-review` selection and fix the ZMK, Zephyr and West
+command commits. During explicit preparation, run
+`python3 tools/verify_review_dependencies.py` before `west update` to
+verify the actual remote review branch. Ordinary tests reuse those prepared
+inputs and do not fetch dependencies. `OWNER_TEST_OUTPUT` optionally selects
+an isolated build directory; board builds run one target at a time with
+compiler parallelism controlled by `CMAKE_BUILD_PARALLEL_LEVEL`.
+
+`python3 -m unittest` also builds and runs the central and peripheral
+`tests/firmware` regression apps. They compile the production request/relay
+implementations with real Zephyr queues and nanopb, using synthetic sensor,
+Studio and split transport boundaries. They cover capture ownership, busy
+queues, lock/disconnect retirement and late replies. These logic tests
+complement the original native fixtures, board matrix and Renode scenarios;
+they do not establish physical transport or sensor acceptance.
 
 #### Option0: Dev container (recommended)
 
@@ -564,16 +610,34 @@ the same chip-select and IRQ pins the test snippet's devicetree uses.
 Renode's stock model omits, which the nRF level-sensitive interrupt path
 needs.)
 
+Run these commands inside the documented build container. Prepare the test
+environment separately from execution:
+
+```bash
+python3 tools/renode_core.py prepare --cache /tmp/pmw-renode-core --jobs 2
+```
+
+This prepares Renode 1.16.1 and builds its CPU library from checksum-pinned
+sources with the local `tools/renode_spurious_irq.patch`. The patch handles an
+NVIC acknowledgement that reports no pending exception, before it can be used
+as a vector number. This Linux x86_64 container profile leaves the installed
+emulator intact and applies the backport to each process's temporary CPU
+library. The included synthetic regression verifies the original failure,
+continued thread execution, and delivery of a subsequent real interrupt.
+`prepare --offline` reuses already downloaded inputs; `run` validates prepared
+file hashes and never downloads or builds dependencies. Use the same cache
+for the commands below.
+
 ```bash
 # Build the emulation-only image (see tests/zmk-config/build-renode.yaml)
 west zmk-build tests/zmk-config \
   --build-yaml tests/zmk-config/build-renode.yaml -af renode
 
-# Boot it against the simulated sensor and run the driver tests. Renode is
-# downloaded automatically on first use (portable tarball, cached under
-# ~/.renode). --skip-smoke: the generic smoke test uses a sensor-less
+# Boot it against the simulated sensor and run the driver tests.
+# --skip-smoke: the generic smoke test uses a sensor-less
 # platform, so run only this module's sensor tests.
-west zmk-renode-test tests/renode \
+python3 tools/renode_core.py run --cache /tmp/pmw-renode-core -- \
+  west zmk-renode-test tests/renode \
   --elf build/renode/zephyr/zmk.elf --skip-smoke
 ```
 
@@ -612,17 +676,20 @@ The two halves are the `pmw3610_usb_wired_split_{left,right}` shields, built wit
 west zmk-build tests/zmk-config --build-yaml tests/zmk-config/build-usb-split.yaml -af usb-wired-central
 west zmk-build tests/zmk-config --build-yaml tests/zmk-config/build-usb-split.yaml -af usb-wired-peripheral
 
-# Boots both halves + drives the relay round-trip (needs a wired-split-capable
-# zmk-west-commands; run only this module's tests with --skip-smoke).
-west zmk-renode-test --mode wired-split \
+# Boots both halves, runs the three wired smoke checks, then the module tests.
+python3 tools/renode_core.py run --cache /tmp/pmw-renode-core -- \
+  west zmk-renode-test --mode wired-split \
   --elf build/usb-wired-central/zephyr/zmk.elf \
   --peripheral-elf build/usb-wired-peripheral/zephyr/zmk.elf \
-  tests/renode --skip-smoke
+  tests/renode
 ```
 
-> The central shield sets `CONFIG_ZMK_STUDIO_LOCKING=n`: a headless Renode run
-> has no physical unlock key, and Studio otherwise rejects every RPC with
-> `UNLOCK_REQUIRED` before it can dispatch the relay.
+The central shield enables locking with a short idle timeout. The harness
+presses the emulated `&studio_unlock` key before secured calls. It also starts
+a peripheral image stream and verifies that the core idle lock stops capture
+over the wired control path, rejects a later RPC with `UNLOCK_REQUIRED`, and
+leaves the image stream quiet after previously queued bytes have drained.
+The first key remains available to the original wired key-relay smoke test.
 
 CI runs this automatically in the `Renode PMW3610 wired-split relay test` job.
 

@@ -1,0 +1,18 @@
+--- a/arch/arm/helper.c
++++ b/arch/arm/helper.c
+@@ -1294,7 +1294,14 @@
+             tlib_nvic_set_pending_irq(ARMV7M_EXCP_SECURE);
+             return;
+         case EXCP_IRQ:
+-            env->v7m.exception = tlib_nvic_acknowledge_irq();
++            nr = tlib_nvic_acknowledge_irq();
++            /* Renode NVIC reserves 16 + 512 for "no pending exception".
++             * A withdrawn IRQ must not change CPU state or fetch a vector. */
++            if(nr == ARMV7M_EXCP_HARDIRQ0 + 512) {
++                tlib_printf(LOG_LEVEL_WARNING, "NVIC spurious acknowledgement ignored");
++                return;
++            }
++            env->v7m.exception = nr;
+             if(env->v7m.has_trustzone) {
+                 /* If we have TrustZone, NVIC_ITNSx determines the security state
+                  * the hardware IRQ is taken to */

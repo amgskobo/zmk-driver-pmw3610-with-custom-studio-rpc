@@ -56,6 +56,13 @@ void pmw3610_relay_dispatch_request(uint32_t source, const cormoran_pmw3610_Requ
  */
 uint32_t pmw3610_relay_broadcast_request(const cormoran_pmw3610_Request *req);
 
+/* Central only: revoke queued/late replies and streams on Studio lock, and
+ * broadcast a stop independently of the peripheral's request queue. */
+void pmw3610_relay_revoke_session(void);
+
+/* Peripheral only: discard requests admitted by the retired split link. */
+void pmw3610_relay_retire_requests(void);
+
 /** @brief Relay `notification` to the central (split peripheral role only).
  *
  * The central re-raises it as the actual Studio custom notification once it

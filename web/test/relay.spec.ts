@@ -167,6 +167,84 @@ describe("PeripheralResponseCorrelator", () => {
 });
 
 describe("callPmw3610Request", () => {
+  it("retains every early broadcast inventory source until collection starts", async () => {
+    const correlator = new PeripheralResponseCorrelator();
+    const service = {
+      callRPC: jest.fn(async () => {
+        for (const source of [1, 2]) {
+          correlator.handleNotificationPayload(
+            Notification.encode(
+              Notification.create({
+                peripheralResponse: {
+                  source,
+                  requestId: 11,
+                  response: { getInfo: { devices: [{ deviceIndex: 0 }] } },
+                },
+              })
+            ).finish()
+          );
+        }
+        return Response.encode(
+          Response.create({ getInfo: { devices: [], relayRequestId: 11 } })
+        ).finish();
+      }),
+    };
+    const response = await callPmw3610Request(
+      service,
+      new Uint8Array(),
+      correlator
+    );
+    const results = await correlator.collectBroadcast(
+      response.getInfo!.relayRequestId,
+      25
+    );
+    expect(results.map((result) => result.source)).toEqual([1, 2]);
+  });
+
+  it("retains a PeripheralResponse that arrives before the DeferredResponse ACK", async () => {
+    const correlator = new PeripheralResponseCorrelator(25);
+    const service = {
+      callRPC: jest.fn(async () => {
+        correlator.handleNotificationPayload(
+          Notification.encode(
+            Notification.create({
+              peripheralResponse: {
+                source: 1,
+                requestId: 11,
+                response: { readRegister: { value: 42 } },
+              },
+            })
+          ).finish()
+        );
+        return Response.encode(
+          Response.create({ deferred: { requestId: 11 } })
+        ).finish();
+      }),
+    };
+    await expect(
+      callPmw3610Request(service, new Uint8Array(), correlator)
+    ).resolves.toEqual(
+      expect.objectContaining({ readRegister: { value: 42 } })
+    );
+  });
+
+  it("rejects a retired session's late DeferredResponse ACK", async () => {
+    const correlator = new PeripheralResponseCorrelator(25);
+    let finishRpc!: (value: Uint8Array) => void;
+    const service = {
+      callRPC: jest.fn(
+        () => new Promise<Uint8Array>((resolve) => (finishRpc = resolve))
+      ),
+    };
+    const pending = callPmw3610Request(service, new Uint8Array(), correlator);
+    const assertion = expect(pending).rejects.toThrow("old connection retired");
+    correlator.clear("old connection retired");
+    finishRpc(
+      Response.encode(Response.create({ deferred: { requestId: 3 } })).finish()
+    );
+    await assertion;
+  });
+
   it("returns the response directly when it is not deferred", async () => {
     const correlator = new PeripheralResponseCorrelator();
     const responsePayload = Response.encode(

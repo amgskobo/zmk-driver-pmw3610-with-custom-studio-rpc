@@ -5,6 +5,7 @@
 
 #include <zephyr/kernel.h>
 #include <zephyr/sys/util.h>
+#include <zephyr/sys/atomic.h>
 #include <zmk/event_manager.h>
 #include <zmk/workqueue.h>
 
@@ -354,32 +355,14 @@ static int notify_frame_stream_chunk(uint32_t stream_frame_id, uint32_t offset, 
     return ret;
 }
 
-/* Streaming state, guarded implicitly by running only on ZMK's dedicated
- * low-priority workqueue (frame_stream_work -- see zmk/workqueue.h; kept off
- * the system workqueue so a capture loop cannot block unrelated system
- * workqueue consumers system-wide) and being set from the RPC/relay-executor
- * thread (which ZMK serializes one-request-at-a-time) -- no separate lock
- * needed since the only cross-thread fields are the bools
- * `frame_stream_active`/`frame_stream_session_active`, each only ever
- * read-modify-written as a whole, and `frame_stream_active` is the sole
- * field the RPC thread writes after the session starts (mirrors the
- * pre-Phase-G synchronization argument).
- *
- * `frame_stream_active`: desired state (should the loop keep going).
- * `frame_stream_session_active`: whether pmw3610_frame_capture_begin() has
- * succeeded and pmw3610_frame_capture_end() has not yet run for it -- set by
- * handle_set_frame_stream_request() right after a successful begin() (RPC
- * thread), cleared by frame_stream_work_handler() itself (lowprio queue)
- * once it calls end(). Whenever frame_stream_active is true there is always
- * exactly one instance of frame_stream_work scheduled-or-running (the enable
- * path schedules it once; the handler keeps self-rescheduling with
- * K_NO_WAIT while active), so flipping frame_stream_active to false from
- * any thread (SetFrameStream(false), the Studio lock listener, or the split
- * disconnect listener) is enough to guarantee frame_stream_work_handler
- * observes it on its very next run and ends the session there -- no
- * separate "stop" work item is needed. */
-static bool frame_stream_active;
+/* The mutex owns the sensor session and shared frame buffer. Cancellation
+ * is atomic so a lock/disconnect never waits for a blocking sensor read.
+ * The generation also cancels a begin() that completes after that event. */
+static K_MUTEX_DEFINE(frame_lock);
+static atomic_t frame_stream_active;
+static atomic_t frame_stream_generation;
 static bool frame_stream_session_active;
+static uint32_t frame_stream_session_generation;
 static uint32_t frame_stream_device_index;
 static uint16_t frame_stream_pixel_count;
 static uint16_t frame_stream_max_invalid_retries;
@@ -395,10 +378,28 @@ static uint16_t frame_stream_max_invalid_retries;
 static void frame_stream_work_handler(struct k_work *work);
 static K_WORK_DELAYABLE_DEFINE(frame_stream_work, frame_stream_work_handler);
 
+void pmw3610_request_stop_stream(void) {
+    atomic_inc(&frame_stream_generation);
+    atomic_clear(&frame_stream_active);
+    k_work_reschedule_for_queue(zmk_workqueue_lowprio_work_q(), &frame_stream_work, K_NO_WAIT);
+}
+
+static bool frame_stream_is_current(void) {
+    if (!atomic_get(&frame_stream_active) ||
+        frame_stream_session_generation != (uint32_t)atomic_get(&frame_stream_generation)) {
+        return false;
+    }
+#if !PMW3610_IS_SPLIT_PERIPHERAL
+    if (zmk_studio_core_get_lock_state() != ZMK_STUDIO_CORE_LOCK_STATE_UNLOCKED) {
+        return false;
+    }
+#endif
+    return true;
+}
+
 /* End the in-progress persistent capture session (if any) -- resumes
  * navigation via pmw3610_frame_capture_end(). Always runs on the lowprio
- * queue (called only from frame_stream_work_handler), the same place all
- * other blocking SPI/capture calls for this feature already run. No-op if
+ * queue, or while retiring a cancelled begin(). Caller owns frame_lock. No-op if
  * no session is active (e.g. begin() itself failed, or this stop path
  * already ran once). */
 static void frame_stream_end_session_if_needed(void) {
@@ -414,9 +415,12 @@ static void frame_stream_end_session_if_needed(void) {
 
 static void frame_stream_work_handler(struct k_work *work) {
     ARG_UNUSED(work);
+    k_mutex_lock(&frame_lock, K_FOREVER);
 
-    if (!frame_stream_active) {
+    if (!frame_stream_is_current()) {
+        atomic_clear(&frame_stream_active);
         frame_stream_end_session_if_needed();
+        k_mutex_unlock(&frame_lock);
         return;
     }
 
@@ -425,7 +429,8 @@ static void frame_stream_work_handler(struct k_work *work) {
          * only sets frame_stream_active after a successful begin(). Stop
          * rather than spin with nothing to read from. */
         LOG_WRN("Frame stream: no active capture session, stopping");
-        frame_stream_active = false;
+        atomic_clear(&frame_stream_active);
+        k_mutex_unlock(&frame_lock);
         return;
     }
 
@@ -437,8 +442,9 @@ static void frame_stream_work_handler(struct k_work *work) {
     if (frame_stream_device_index >= device_count) {
         LOG_WRN("Frame stream: device_index %u out of range (have %u device(s)), stopping",
                 (unsigned int)frame_stream_device_index, (unsigned int)device_count);
-        frame_stream_active = false;
+        atomic_clear(&frame_stream_active);
         frame_stream_end_session_if_needed();
+        k_mutex_unlock(&frame_lock);
         return;
     }
     const struct device *dev = pmw3610_get_device(frame_stream_device_index);
@@ -457,12 +463,15 @@ static void frame_stream_work_handler(struct k_work *work) {
     int err = pmw3610_frame_capture_read(dev, &params, frame_buf, sizeof(frame_buf), &capture);
     if (err) {
         LOG_WRN("Frame stream: capture read failed: errno %d", err);
-    } else {
+    } else if (frame_stream_is_current()) {
         frame_id++;
         frame_len = capture.pixel_count;
 
         for (uint32_t offset = 0; offset < capture.pixel_count;
              offset += PMW3610_FRAME_CHUNK_SIZE) {
+            if (!frame_stream_is_current()) {
+                break;
+            }
             uint32_t remaining = capture.pixel_count - offset;
             uint32_t chunk_len = MIN(remaining, PMW3610_FRAME_CHUNK_SIZE);
 
@@ -476,6 +485,10 @@ static void frame_stream_work_handler(struct k_work *work) {
              * previous behavior. */
             int notify_err = 0;
             for (int attempt = 0; attempt < PMW3610_FRAME_STREAM_NOTIFY_MAX_RETRIES; attempt++) {
+                if (!frame_stream_is_current()) {
+                    notify_err = -ECANCELED;
+                    break;
+                }
                 notify_err = notify_frame_stream_chunk(
                     frame_id, offset, &frame_buf[offset], chunk_len, capture.pixel_count,
                     capture.complete, (cormoran_pmw3610_PixelFormat)capture.format);
@@ -491,64 +504,78 @@ static void frame_stream_work_handler(struct k_work *work) {
         }
     }
 
-    /* Back-to-back reschedule with no artificial delay: pmw3610_frame_capture_read()
-     * (~15ms measured for the burst path in DESIGN.md Phase G) already paces
-     * the loop; capture(N+1) overlaps the async USB drain of frame N's
-     * notifications. Hardware validation (Phase G.6) confirms no transport
-     * overrun before adding an inter-frame delay here. */
-    if (frame_stream_active) {
+    /* Capture paces the loop; notifications drain asynchronously. Validate
+     * frame coherence and transport back-pressure on the selected hardware
+     * before making a streaming throughput claim (DESIGN.md G.6). */
+    if (frame_stream_is_current()) {
         k_work_reschedule_for_queue(zmk_workqueue_lowprio_work_q(), &frame_stream_work, K_NO_WAIT);
     } else {
+        atomic_clear(&frame_stream_active);
         frame_stream_end_session_if_needed();
     }
+    k_mutex_unlock(&frame_lock);
 }
 
 static void handle_set_frame_stream_request(const cormoran_pmw3610_SetFrameStreamRequest *req,
                                             cormoran_pmw3610_Response *resp) {
-    if (req->enable) {
-        const struct device *dev = resolve_device(req->device_index, resp);
-        if (!dev) {
+    if (!req->enable) {
+        pmw3610_request_stop_stream();
+    } else {
+        if (k_mutex_lock(&frame_lock, K_NO_WAIT) != 0) {
+            set_error(resp, "SetFrameStream: capture is busy; retry after it finishes");
             return;
         }
-
-        if (!frame_stream_active) {
+        const struct device *dev = resolve_device(req->device_index, resp);
+        if (!dev) {
+            k_mutex_unlock(&frame_lock);
+            return;
+        }
+        uint16_t pixels =
+            (uint16_t)MIN(req->pixel_count, (uint32_t)CONFIG_ZMK_PMW3610_STUDIO_RPC_FRAME_BUF_SIZE);
+        uint16_t retries = (uint16_t)MIN(req->max_invalid_retries, (uint32_t)UINT16_MAX);
+        if (frame_stream_session_active) {
+            if (!frame_stream_is_current() || req->device_index != frame_stream_device_index ||
+                pixels != frame_stream_pixel_count || retries != frame_stream_max_invalid_retries) {
+                set_error(resp, "SetFrameStream: stop the current session before changing it");
+                k_mutex_unlock(&frame_lock);
+                return;
+            }
+        } else {
             /* Starting a new session: begin() once (may take up to ~700ms
              * if the sensor was in a deep rest mode -- see
              * pmw3610_frame_capture_begin()'s docs), surfaced as an error
              * response on failure with streaming left off. */
-            struct pmw3610_frame_capture_params params = {
-                .pixel_count = (uint16_t)MIN(
-                    req->pixel_count, (uint32_t)CONFIG_ZMK_PMW3610_STUDIO_RPC_FRAME_BUF_SIZE),
-                .max_invalid_retries =
-                    (uint16_t)MIN(req->max_invalid_retries, (uint32_t)UINT16_MAX),
-            };
+            uint32_t generation = (uint32_t)atomic_get(&frame_stream_generation);
+            struct pmw3610_frame_capture_params params = {.pixel_count = pixels,
+                                                          .max_invalid_retries = retries};
             int err = pmw3610_frame_capture_begin(dev, &params);
             if (err) {
                 set_error(resp, "SetFrameStream: failed to begin capture session: errno %d", err);
+                k_mutex_unlock(&frame_lock);
                 return;
             }
+            frame_stream_device_index = req->device_index;
+            frame_stream_pixel_count = pixels;
+            frame_stream_max_invalid_retries = retries;
+            frame_stream_session_generation = generation;
             frame_stream_session_active = true;
-        }
-
-        frame_stream_device_index = req->device_index;
-        frame_stream_pixel_count =
-            (uint16_t)MIN(req->pixel_count, (uint32_t)CONFIG_ZMK_PMW3610_STUDIO_RPC_FRAME_BUF_SIZE);
-        frame_stream_max_invalid_retries =
-            (uint16_t)MIN(req->max_invalid_retries, (uint32_t)UINT16_MAX);
-
-        bool already_active = frame_stream_active;
-        frame_stream_active = true;
-        if (!already_active) {
+            atomic_set(&frame_stream_active, 1);
+            if (!frame_stream_is_current()) {
+                atomic_clear(&frame_stream_active);
+                frame_stream_end_session_if_needed();
+                set_error(resp, "SetFrameStream: session was cancelled while starting");
+                k_mutex_unlock(&frame_lock);
+                return;
+            }
             k_work_reschedule_for_queue(zmk_workqueue_lowprio_work_q(), &frame_stream_work,
                                         K_NO_WAIT);
         }
-    } else {
-        frame_stream_active = false;
+        k_mutex_unlock(&frame_lock);
     }
 
     cormoran_pmw3610_SetFrameStreamResponse result =
         cormoran_pmw3610_SetFrameStreamResponse_init_zero;
-    result.streaming = frame_stream_active;
+    result.streaming = atomic_get(&frame_stream_active) != 0;
 
     resp->which_response_type = cormoran_pmw3610_Response_set_frame_stream_tag;
     resp->response_type.set_frame_stream = result;
@@ -572,7 +599,10 @@ static int on_studio_core_lock_state_changed(const zmk_event_t *eh) {
     }
 
     if (ev->state == ZMK_STUDIO_CORE_LOCK_STATE_LOCKED) {
-        frame_stream_active = false;
+        pmw3610_request_stop_stream();
+#if IS_ENABLED(CONFIG_ZMK_PMW3610_SPLIT_RPC_RELAY) && IS_ENABLED(CONFIG_ZMK_SPLIT_ROLE_CENTRAL)
+        pmw3610_relay_revoke_session();
+#endif
     }
 
     return 0;
@@ -597,7 +627,10 @@ static int on_split_peripheral_status_changed(const zmk_event_t *eh) {
     }
 
     if (!ev->connected) {
-        frame_stream_active = false;
+        pmw3610_request_stop_stream();
+#if IS_ENABLED(CONFIG_ZMK_PMW3610_SPLIT_RPC_RELAY)
+        pmw3610_relay_retire_requests();
+#endif
     }
 
     return 0;
@@ -609,7 +642,7 @@ ZMK_SUBSCRIPTION(zmk_pmw3610_split_status_listener, zmk_split_peripheral_status_
 
 static void handle_capture_frame_request(const cormoran_pmw3610_CaptureFrameRequest *req,
                                          cormoran_pmw3610_Response *resp) {
-    if (frame_stream_active) {
+    if (atomic_get(&frame_stream_active) || frame_stream_session_active) {
         set_error(resp, "frame streaming is active; call SetFrameStream(enable=false) first");
         return;
     }
@@ -692,10 +725,20 @@ bool pmw3610_request_exec_handle(const cormoran_pmw3610_Request *req,
         handle_write_register_request(&req->request_type.write_register, resp);
         return true;
     case cormoran_pmw3610_Request_capture_frame_tag:
+        if (k_mutex_lock(&frame_lock, K_NO_WAIT) != 0) {
+            set_error(resp, "frame capture is busy");
+            return true;
+        }
         handle_capture_frame_request(&req->request_type.capture_frame, resp);
+        k_mutex_unlock(&frame_lock);
         return true;
     case cormoran_pmw3610_Request_get_frame_chunk_tag:
+        if (k_mutex_lock(&frame_lock, K_NO_WAIT) != 0) {
+            set_error(resp, "frame capture is busy");
+            return true;
+        }
         handle_get_frame_chunk_request(&req->request_type.get_frame_chunk, resp);
+        k_mutex_unlock(&frame_lock);
         return true;
     case cormoran_pmw3610_Request_set_frame_stream_tag:
         handle_set_frame_stream_request(&req->request_type.set_frame_stream, resp);

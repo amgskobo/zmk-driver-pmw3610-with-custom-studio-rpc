@@ -76,7 +76,7 @@ include:
   # working BT stack to link it, which is out of scope for this check. This
   # build only proves the central broadcast test code compiles/links; its
   # PASS/FAIL boot-log output is not observable without real hardware (see
-  # DESIGN.md "Hardware validation status").
+  # DESIGN.md "Relay execution and validation requirements").
   - artifact: pmw3610_split_central
     board: xiao_ble//zmk
     shield: tester_xiao

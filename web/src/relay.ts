@@ -9,6 +9,7 @@ import { Notification, Response } from "./proto/cormoran/pmw3610/pmw3610";
 
 const DEFAULT_TIMEOUT_MS = 6000; // > firmware's ~5s frame-capture deadline
 const DEFAULT_BROADCAST_WINDOW_MS = 2000;
+const MAX_EARLY_RESPONSES = 64;
 
 /**
  * GetInfoRequest.source sentinel ("list every PMW3610 across the whole
@@ -30,6 +31,16 @@ interface BroadcastListener {
   onResponse: (source: number, response: Response) => void;
 }
 
+interface SourcedResponse {
+  source: number;
+  response: Response;
+}
+
+interface EarlyBroadcast {
+  responses: SourcedResponse[];
+  timeoutId: ReturnType<typeof setTimeout>;
+}
+
 /**
  * Tracks relayed requests awaiting their PeripheralResponse notification.
  * One instance is enough per subsystem connection -- requestId is assigned
@@ -39,8 +50,54 @@ interface BroadcastListener {
 export class PeripheralResponseCorrelator {
   private pending = new Map<number, PendingRequest>();
   private broadcastListeners = new Map<number, BroadcastListener>();
+  private rpcWindows = new Set<Map<number, SourcedResponse[]>>();
+  private earlyBroadcasts = new Map<number, EarlyBroadcast>();
+  private generation = 0;
+  private clearReason = "Connection changed";
 
   constructor(private readonly timeoutMs: number = DEFAULT_TIMEOUT_MS) {}
+
+  /** Buffer only while an RPC is awaiting its immediate reply. The split
+   * notification can precede that reply, before its request id is known.
+   * Windows are bounded and closed by the caller even when the RPC fails. */
+  beginRpc() {
+    const generation = this.generation;
+    const responses = new Map<number, SourcedResponse[]>();
+    this.rpcWindows.add(responses);
+    return {
+      assertCurrent: () => {
+        if (generation !== this.generation) {
+          throw new Error(this.clearReason);
+        }
+      },
+      responseFor: (requestId: number) =>
+        responses.get(requestId)?.[0]?.response,
+      broadcastFor: (requestId: number) => responses.get(requestId) ?? [],
+      close: () => {
+        this.rpcWindows.delete(responses);
+        responses.clear();
+      },
+    };
+  }
+
+  /** Bridge the immediate GetInfo reply to the caller's collection window,
+   * including replies received before the relay request id was known. */
+  prepareBroadcast(requestId: number, responses: SourcedResponse[]): void {
+    const old = this.earlyBroadcasts.get(requestId);
+    if (old) clearTimeout(old.timeoutId);
+    if (this.earlyBroadcasts.size >= MAX_EARLY_RESPONSES) {
+      const oldest = this.earlyBroadcasts.keys().next().value!;
+      clearTimeout(this.earlyBroadcasts.get(oldest)!.timeoutId);
+      this.earlyBroadcasts.delete(oldest);
+    }
+    this.earlyBroadcasts.set(requestId, {
+      responses: [...responses],
+      timeoutId: setTimeout(
+        () => this.earlyBroadcasts.delete(requestId),
+        this.timeoutMs
+      ),
+    });
+  }
 
   /** Register interest in `requestId`'s eventual PeripheralResponse. */
   waitFor(requestId: number): Promise<Response> {
@@ -69,8 +126,13 @@ export class PeripheralResponseCorrelator {
     requestId: number,
     windowMs: number = DEFAULT_BROADCAST_WINDOW_MS
   ): Promise<Array<{ source: number; response: Response }>> {
+    const early = this.earlyBroadcasts.get(requestId);
+    if (early) clearTimeout(early.timeoutId);
+    this.earlyBroadcasts.delete(requestId);
     return new Promise((resolve) => {
-      const results: Array<{ source: number; response: Response }> = [];
+      const results: Array<{ source: number; response: Response }> = [
+        ...(early?.responses ?? []),
+      ];
       this.broadcastListeners.set(requestId, {
         onResponse: (source, response) => results.push({ source, response }),
       });
@@ -107,7 +169,36 @@ export class PeripheralResponseCorrelator {
       broadcastListener.onResponse(source, response);
       return true;
     }
+    const early = this.earlyBroadcasts.get(requestId);
+    if (early) {
+      this.addEarlyResponse(early.responses, source, response);
+      return true;
+    }
+    for (const responses of this.rpcWindows) {
+      const existing = responses.get(requestId);
+      if (existing) {
+        this.addEarlyResponse(existing, source, response);
+        continue;
+      }
+      if (responses.size >= MAX_EARLY_RESPONSES) {
+        responses.delete(responses.keys().next().value!);
+      }
+      responses.set(requestId, [{ source, response }]);
+    }
     return false;
+  }
+
+  private addEarlyResponse(
+    responses: SourcedResponse[],
+    source: number,
+    response: Response
+  ): void {
+    if (
+      responses.length < MAX_EARLY_RESPONSES &&
+      !responses.some((entry) => entry.source === source)
+    ) {
+      responses.push({ source, response });
+    }
   }
 
   private resolve(requestId: number, response: Response): boolean {
@@ -126,6 +217,13 @@ export class PeripheralResponseCorrelator {
    * whatever they already collected -- there's nothing to "reject" about
    * partial inventory data. */
   clear(reason: string): void {
+    this.generation++;
+    this.clearReason = reason;
+    for (const responses of this.rpcWindows) responses.clear();
+    this.rpcWindows.clear();
+    for (const early of this.earlyBroadcasts.values())
+      clearTimeout(early.timeoutId);
+    this.earlyBroadcasts.clear();
     for (const pending of this.pending.values()) {
       clearTimeout(pending.timeoutId);
       pending.reject(new Error(reason));
@@ -146,13 +244,28 @@ export async function callPmw3610Request(
   encodedRequest: Uint8Array,
   correlator: PeripheralResponseCorrelator
 ): Promise<Response> {
-  const responsePayload = await service.callRPC(encodedRequest);
-  if (!responsePayload) {
-    throw new Error("Empty response");
+  const window = correlator.beginRpc();
+  try {
+    const responsePayload = await service.callRPC(encodedRequest);
+    window.assertCurrent();
+    if (!responsePayload) {
+      throw new Error("Empty response");
+    }
+    const response = Response.decode(responsePayload);
+    if (response.deferred) {
+      return (
+        window.responseFor(response.deferred.requestId) ??
+        correlator.waitFor(response.deferred.requestId)
+      );
+    }
+    if (response.getInfo?.relayRequestId) {
+      correlator.prepareBroadcast(
+        response.getInfo.relayRequestId,
+        window.broadcastFor(response.getInfo.relayRequestId)
+      );
+    }
+    return response;
+  } finally {
+    window.close();
   }
-  const response = Response.decode(responsePayload);
-  if (response.deferred) {
-    return correlator.waitFor(response.deferred.requestId);
-  }
-  return response;
 }

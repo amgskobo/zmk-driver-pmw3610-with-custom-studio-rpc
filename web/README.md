@@ -21,7 +21,8 @@ PMW3610 ZMK module's custom Studio RPC subsystem.
   subscribes to `FrameStreamChunk` custom Studio notifications pushed by the
   firmware (no client-side polling loop) -- see "Frame viewer notes" below.
   Also shows an FPS counter, an invalid-byte (PG_VALID clear) warning count,
-  and an advanced panel for the per-pixel retry budget.
+  and an advanced capture-wait control (RAW8: post-arm milliseconds;
+  PG7: 10 ms ready-wait retry units).
 - **Studio lock awareness**: the `cormoran__pmw3610` subsystem is secured
   (see the module README's "Security" section) -- the UI shows a banner and
   disables settings/frame controls while ZMK Studio is locked, and reacts to
@@ -31,6 +32,8 @@ PMW3610 ZMK module's custom Studio RPC subsystem.
   simplified ZMK integration
 
 ## Quick Start
+
+Run these commands inside the repository's Docker development environment.
 
 ```bash
 # Install dependencies
@@ -95,15 +98,12 @@ npm run generate
 ```
 
 This runs `buf generate`, which uses the configuration in `buf.gen.yaml`.
-`buf.gen.yaml` lists **two** input directories: this repo's own `../proto`,
-and the west dependency checkout at
-`../dependencies/zmk-feature-custom-settings/proto` (generated straight from
-there, not vendored into this repo's `proto/` tree -- vendoring it there
-would make this module's own firmware-side nanopb glob
-(`CMakeLists.txt: proto/*.proto`) pick it up too and generate a second,
-conflicting copy of the `cormoran.zmk.custom_settings` package, which would
-fail to link into the `pmw3610_settings_rpc` test artifact that includes
-both modules).
+`buf.gen.yaml` lists **two** input directories: this repo's own `../proto`
+and the vendored Custom Settings schema under `web/proto`. The vendored
+file records its source commit and re-sync procedure. Keeping it outside
+the repo-root `proto/` tree avoids duplicate firmware-side nanopb symbols
+when both modules are enabled, and lets Web CI build without a West
+workspace.
 
 ### 3. Using react-zmk-studio
 
@@ -184,20 +184,18 @@ device_index, pixel_count, max_invalid_retries}`, then the firmware
   `createFrameAssembler()` in `src/frame.ts` incrementally reassembles
   chunks (by `frame_id`/`offset`) into a full frame and reports when it's
   complete so the canvas renders once per frame, not per chunk.
-  "Stop Streaming" calls `SetFrameStream{enable: false, ...}` and
-  unsubscribes. `CaptureFrame` and `SetFrameStream` share the same
+  "Stop Streaming" calls `SetFrameStream{enable: false, ...}` and waits
+  for its acknowledgement; a failed stop remains available for retry.
+  Connection changes retire pending work and stop the owned stream using
+  its original connection. `CaptureFrame` and `SetFrameStream` share the same
   firmware-side buffer/frame_id, so the UI disables "Capture Once" while
   streaming is on.
 - Frame rate depends on the sensor's wiring (`disable-burst-read`, see the
-  module README's "Wiring" section): the default 4-wire burst path resets
+  module README's sensor configuration): the default 4-wire burst path resets
   the sensor only once per streaming session and reads a whole frame in one
-  SPI transaction, so it is sensor-limited rather than reset-limited -- much
-  faster than earlier per-pixel-only builds. The 3-wire fallback still
-  captures one 484-pixel frame via the `Pixel_Grab` procedure in roughly 2
-  seconds (measured on real hardware), so expect on the order of 0.4-0.5 fps
-  there -- not a bug, a correctness fallback for wiring that can't do a real
-  burst read, not a performance target. The FPS counter reflects whichever
-  path is actually wired up.
+  SPI transaction. The per-pixel fallback waits for individual sensor
+  handshakes. Actual frame coherence and throughput need validation on the
+  selected hardware and transport. The FPS counter reports received frames.
 - If ZMK Studio locks while a stream is active, the firmware stops the loop
   on its own (see the module README's "Security" section) but cannot notify
   the client that it did so (notifications aren't request/response) -- the

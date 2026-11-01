@@ -31,6 +31,17 @@ interface AdvancedOptions {
   maxInvalidRetries: string;
 }
 
+interface FrameSession {
+  active: boolean;
+  operation: "capture" | "start" | "stop" | null;
+  retired: boolean;
+  generation: number;
+  side: number;
+  source: number;
+  correlator: PeripheralResponseCorrelator;
+  stop?: () => Promise<boolean>;
+}
+
 const DEFAULT_ADVANCED: AdvancedOptions = {
   maxInvalidRetries: "",
 };
@@ -47,6 +58,7 @@ export interface FrameViewerProps {
 export function FrameViewer({ locked = false }: FrameViewerProps = {}) {
   const zmkApp = useContext(ZMKAppContext);
   const subsystem = zmkApp?.findSubsystem(PMW3610_SUBSYSTEM_IDENTIFIER);
+  const connection = zmkApp?.state.connection;
 
   const [side, setSide] = useState(DEFAULT_SIDE);
   const [deviceIndex, setDeviceIndex] = useState(0);
@@ -56,7 +68,11 @@ export function FrameViewer({ locked = false }: FrameViewerProps = {}) {
   const [advanced, setAdvanced] = useState<AdvancedOptions>(DEFAULT_ADVANCED);
   const [showAdvanced, setShowAdvanced] = useState(false);
   const [isCapturing, setIsCapturing] = useState(false);
-  const [isStreaming, setIsStreaming] = useState(false);
+  const [streamState, setStreamState] = useState({
+    streaming: false,
+    changing: false,
+  });
+  const { streaming: isStreaming, changing: isStreamChanging } = streamState;
   const [invalidCount, setInvalidCount] = useState<number | null>(null);
   const [pixelCount, setPixelCount] = useState<number | null>(null);
   const [complete, setComplete] = useState<boolean | null>(null);
@@ -68,8 +84,7 @@ export function FrameViewer({ locked = false }: FrameViewerProps = {}) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const frameCountRef = useRef(0);
   const fpsWindowStartRef = useRef(0);
-  const isStreamingRef = useRef(false);
-  const correlatorRef = useRef(new PeripheralResponseCorrelator());
+  const sessionRef = useRef<FrameSession | null>(null);
   // Per-frame_id incremental assembler, keyed so a late chunk from a
   // previous frame_id (should not happen, but notifications are
   // best-effort/unordered in principle) cannot corrupt the current frame.
@@ -78,20 +93,49 @@ export function FrameViewer({ locked = false }: FrameViewerProps = {}) {
   );
 
   useEffect(() => {
-    isStreamingRef.current = isStreaming;
-  }, [isStreaming]);
+    const session: FrameSession = {
+      active: false,
+      operation: null,
+      retired: false,
+      generation: 0,
+      side: DEFAULT_SIDE,
+      source: 0,
+      correlator: new PeripheralResponseCorrelator(),
+    };
+    sessionRef.current = session;
+    // Reset controls when the external connection/subsystem changes.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    setStreamState({ streaming: false, changing: false });
+    setIsCapturing(false);
+    return () => {
+      session.retired = true;
+      // Retire a pending start as well as an active stream. A pending stop
+      // already targets this connection; do not issue it twice.
+      if (session.operation !== "stop") {
+        void session.stop?.().catch(() => undefined);
+      }
+      session.active = false;
+      session.correlator.clear("Subsystem changed or component unmounted");
+    };
+  }, [connection, subsystem?.index]);
 
-  const callRequest = async (request: Request): Promise<Response> => {
-    const connection = zmkApp?.state.connection;
+  const callRequest = async (
+    request: Request,
+    session: FrameSession
+  ): Promise<Response> => {
     if (!connection || !subsystem) {
       throw new Error("PMW3610 subsystem is not available");
     }
     const service = new ZMKCustomSubsystem(connection, subsystem.index);
     const payload = Request.encode(request).finish();
-    return callPmw3610Request(service, payload, correlatorRef.current);
+    return callPmw3610Request(service, payload, session.correlator);
   };
 
-  const captureOnce = async (): Promise<void> => {
+  const captureOnce = async (
+    session: FrameSession,
+    generation: number
+  ): Promise<void> => {
+    const current = () => !session.retired && session.generation === generation;
     const pixelCountRequested = side * side;
     const captureResp = await callRequest(
       Request.create({
@@ -103,8 +147,10 @@ export function FrameViewer({ locked = false }: FrameViewerProps = {}) {
             ? Number.parseInt(advanced.maxInvalidRetries, 10)
             : 0,
         },
-      })
+      }),
+      session
     );
+    if (!current()) return;
     if (captureResp.error) {
       throw new Error(captureResp.error.message);
     }
@@ -121,8 +167,10 @@ export function FrameViewer({ locked = false }: FrameViewerProps = {}) {
       const chunkResp = await callRequest(
         Request.create({
           getFrameChunk: { frameId: captureFrame.frameId, offset, source },
-        })
+        }),
+        session
       );
+      if (!current()) return;
       if (chunkResp.error) {
         throw new Error(chunkResp.error.message);
       }
@@ -170,11 +218,10 @@ export function FrameViewer({ locked = false }: FrameViewerProps = {}) {
     // Uint8ClampedArray<ArrayBufferLike> so it stays independent of DOM
     // lib types for testability. Copying into a plain ArrayBuffer-backed
     // array satisfies the stricter DOM type without changing frame.ts.
-    const imageData = new ImageData(
-      new Uint8ClampedArray(rgba),
-      sideLength,
-      Math.ceil(bytes.length / sideLength)
-    );
+    const height = Math.ceil(bytes.length / sideLength);
+    const paddedRgba = new Uint8ClampedArray(sideLength * height * 4);
+    paddedRgba.set(rgba);
+    const imageData = new ImageData(paddedRgba, sideLength, height);
     offCtx.putImageData(imageData, 0, 0);
 
     ctx.imageSmoothingEnabled = false;
@@ -193,11 +240,16 @@ export function FrameViewer({ locked = false }: FrameViewerProps = {}) {
   };
 
   const handleCaptureOnce = async () => {
+    const session = sessionRef.current;
+    if (!session || session.operation || session.active || locked) return;
+    session.operation = "capture";
+    const generation = session.generation;
     setIsCapturing(true);
     setError(null);
     try {
-      await captureOnce();
+      await captureOnce(session, generation);
     } catch (e) {
+      if (session.retired || session.generation !== generation) return;
       if (isUnlockRequiredError(e)) {
         setError(
           "ZMK Studio is locked -- press the Studio unlock key on your keyboard."
@@ -206,7 +258,8 @@ export function FrameViewer({ locked = false }: FrameViewerProps = {}) {
         setError(e instanceof Error ? e.message : "Unknown error");
       }
     } finally {
-      setIsCapturing(false);
+      session.operation = null;
+      if (!session.retired) setIsCapturing(false);
     }
   };
 
@@ -214,10 +267,20 @@ export function FrameViewer({ locked = false }: FrameViewerProps = {}) {
   // starts a firmware-side capture loop that raises one FrameStreamChunk
   // notification per 128-byte chunk of every captured frame, instead of
   // this component polling CaptureFrame+GetFrameChunk in a loop. Ignored
-  // unless this component is actually streaming (isStreamingRef), so a
+  // unless this connection owns an active stream, so a
   // stray/late chunk after Stop Streaming doesn't render.
   const handleFrameStreamNotification = (chunk: FrameStreamChunk) => {
-    if (!isStreamingRef.current) return;
+    const session = sessionRef.current;
+    if (
+      !session?.active ||
+      session.retired ||
+      chunk.source !== session.source
+    ) {
+      return;
+    }
+    if (chunk.totalSize <= 0 || chunk.totalSize > session.side * session.side) {
+      return;
+    }
 
     const assemblers = assemblersRef.current;
     // A new frame_id means any previous (necessarily incomplete, or it
@@ -251,7 +314,7 @@ export function FrameViewer({ locked = false }: FrameViewerProps = {}) {
       if (!isValidPixelByte(b, format)) invalidCount++;
     }
 
-    renderFrame(bytes, side, format);
+    renderFrame(bytes, session.side, format);
     setInvalidCount(invalidCount);
     setPixelCount(chunk.totalSize);
     setComplete(chunk.complete);
@@ -268,7 +331,10 @@ export function FrameViewer({ locked = false }: FrameViewerProps = {}) {
     }
   };
 
-  const setFrameStream = async (enable: boolean): Promise<boolean> => {
+  const setFrameStream = async (
+    enable: boolean,
+    session: FrameSession
+  ): Promise<boolean> => {
     const resp = await callRequest(
       Request.create({
         setFrameStream: {
@@ -280,25 +346,53 @@ export function FrameViewer({ locked = false }: FrameViewerProps = {}) {
             ? Number.parseInt(advanced.maxInvalidRetries, 10)
             : 0,
         },
-      })
+      }),
+      session
     );
     if (resp.error) {
       throw new Error(resp.error.message);
     }
-    return resp.setFrameStream?.streaming ?? false;
+    if (!resp.setFrameStream) {
+      throw new Error("SetFrameStream response missing set_frame_stream field");
+    }
+    return resp.setFrameStream.streaming;
   };
 
   const stopStreaming = async () => {
-    setIsStreaming(false);
+    const session = sessionRef.current;
+    if (!session?.active || session.operation || !session.stop) return;
+    session.operation = "stop";
+    const generation = session.generation;
+    setStreamState({ streaming: true, changing: true });
+    setError(null);
     try {
-      await setFrameStream(false);
+      if (await session.stop()) {
+        throw new Error("The device still reports an active frame stream");
+      }
+      session.active = false;
+      session.stop = undefined;
     } catch (e) {
-      setError(e instanceof Error ? e.message : "Unknown error");
+      if (!session.retired && session.generation === generation) {
+        setError(e instanceof Error ? e.message : "Unknown error");
+      }
+    } finally {
+      session.operation = null;
+      if (!session.retired) {
+        setStreamState({ streaming: session.active, changing: false });
+      }
     }
   };
 
   const startStreaming = async () => {
-    if (isStreaming || !zmkApp || !subsystem) return;
+    const session = sessionRef.current;
+    if (!session || session.operation || session.active || locked || !subsystem)
+      return;
+    session.operation = "start";
+    session.side = side;
+    session.source = source;
+    session.stop = () => setFrameStream(false, session);
+    const generation = session.generation;
+    setStreamState({ streaming: false, changing: true });
     setError(null);
     assemblersRef.current.clear();
     frameCountRef.current = 0;
@@ -307,15 +401,26 @@ export function FrameViewer({ locked = false }: FrameViewerProps = {}) {
     setStreamSource(null);
 
     try {
-      const streaming = await setFrameStream(true);
-      setIsStreaming(streaming);
+      const streaming = await setFrameStream(true, session);
+      if (session.retired || session.generation !== generation) {
+        if (streaming) await session.stop().catch(() => undefined);
+        return;
+      }
+      session.active = streaming;
+      if (!streaming) session.stop = undefined;
     } catch (e) {
+      if (session.retired || session.generation !== generation) return;
       if (isUnlockRequiredError(e)) {
         setError(
           "ZMK Studio is locked -- press the Studio unlock key on your keyboard."
         );
       } else {
         setError(e instanceof Error ? e.message : "Unknown error");
+      }
+    } finally {
+      session.operation = null;
+      if (!session.retired) {
+        setStreamState({ streaming: session.active, changing: false });
       }
     }
   };
@@ -325,14 +430,17 @@ export function FrameViewer({ locked = false }: FrameViewerProps = {}) {
   // GetFrameChunk/SetFrameStream with source != 0 answer asynchronously via
   // PeripheralResponse -- see web/src/relay.ts) and FrameStreamChunk
   // notifications, which handleFrameStreamNotification itself gates on
-  // isStreamingRef so a stray chunk after Stop Streaming is dropped.
+  // the owned session so a stray chunk after Stop Streaming is dropped.
   useEffect(() => {
     if (!zmkApp || !subsystem) return;
-    const correlator = correlatorRef.current;
+    let retired = false;
+    const correlator = sessionRef.current?.correlator;
+    if (!correlator) return;
     const unsubscribe = zmkApp.onNotification({
       type: "custom",
       subsystemIndex: subsystem.index,
       callback: (notification) => {
+        if (retired) return;
         if (correlator.handleNotificationPayload(notification.payload)) {
           return;
         }
@@ -348,11 +456,11 @@ export function FrameViewer({ locked = false }: FrameViewerProps = {}) {
       },
     });
     return () => {
+      retired = true;
       unsubscribe();
-      correlator.clear("Subsystem changed or component unmounted");
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [zmkApp, subsystem?.index]);
+  }, [zmkApp, connection, subsystem?.index]);
 
   // If Studio locks while streaming, the firmware stops the stream loop on
   // its own (see the lock listener in pmw3610_handler.c) -- but it does not
@@ -362,16 +470,20 @@ export function FrameViewer({ locked = false }: FrameViewerProps = {}) {
   // staying stuck showing "Stop Streaming" for a stream that no longer
   // exists.
   useEffect(() => {
-    if (locked && isStreaming) {
+    const session = sessionRef.current;
+    if (locked && session) {
+      session.generation++;
+      session.active = false;
       // Reacting to an external system (the firmware silently stopping the
       // stream on lock) becoming out of sync with local UI state, not a
       // derived-state anti-pattern -- see the comment above.
-      // eslint-disable-next-line react-hooks/set-state-in-effect
-      setIsStreaming(false);
+      setStreamState({
+        streaming: false,
+        changing: session.operation === "start" || session.operation === "stop",
+      });
     }
     // Only react to the lock transition, not every isStreaming change.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [locked]);
+  }, [locked, connection, subsystem?.index]);
 
   if (!zmkApp) return null;
 
@@ -405,7 +517,7 @@ export function FrameViewer({ locked = false }: FrameViewerProps = {}) {
           id="side-select"
           value={side}
           onChange={(e) => setSide(Number(e.target.value))}
-          disabled={isStreaming || locked}
+          disabled={isCapturing || isStreaming || isStreamChanging || locked}
         >
           {SIDE_OPTIONS.map((n) => (
             <option key={n} value={n}>
@@ -421,7 +533,7 @@ export function FrameViewer({ locked = false }: FrameViewerProps = {}) {
           min={0}
           value={deviceIndex}
           onChange={(e) => setDeviceIndex(Number(e.target.value))}
-          disabled={isStreaming || locked}
+          disabled={isCapturing || isStreaming || isStreamChanging || locked}
         />
 
         <label htmlFor="frame-source">Split source</label>
@@ -431,7 +543,7 @@ export function FrameViewer({ locked = false }: FrameViewerProps = {}) {
           min={0}
           value={source}
           onChange={(e) => setSource(Number(e.target.value))}
-          disabled={isStreaming || locked}
+          disabled={isCapturing || isStreaming || isStreamChanging || locked}
           title="0 = this device's own sensors; 1+ = a split peripheral's, relayed asynchronously"
         />
       </div>
@@ -439,7 +551,7 @@ export function FrameViewer({ locked = false }: FrameViewerProps = {}) {
       <div className="toolbar">
         <button
           className="btn btn-primary"
-          disabled={isCapturing || isStreaming || locked}
+          disabled={isCapturing || isStreaming || isStreamChanging || locked}
           onClick={() => void handleCaptureOnce()}
         >
           {isCapturing ? "Capturing..." : "Capture Once"}
@@ -447,17 +559,18 @@ export function FrameViewer({ locked = false }: FrameViewerProps = {}) {
         {isStreaming ? (
           <button
             className="btn btn-danger"
+            disabled={isStreamChanging}
             onClick={() => void stopStreaming()}
           >
-            Stop Streaming
+            {isStreamChanging ? "Stopping..." : "Stop Streaming"}
           </button>
         ) : (
           <button
             className="btn"
-            disabled={isCapturing || locked}
+            disabled={isCapturing || isStreamChanging || locked}
             onClick={() => void startStreaming()}
           >
-            Start Streaming
+            {isStreamChanging ? "Starting..." : "Start Streaming"}
           </button>
         )}
       </div>
@@ -470,7 +583,7 @@ export function FrameViewer({ locked = false }: FrameViewerProps = {}) {
         <summary>Advanced (capture tuning)</summary>
         <div className="form-grid">
           <label htmlFor="max-invalid-retries">
-            Per-pixel ready-wait retries, 10ms each (0 = default)
+            Capture wait (0 = default)
           </label>
           <input
             id="max-invalid-retries"
@@ -478,12 +591,15 @@ export function FrameViewer({ locked = false }: FrameViewerProps = {}) {
             min={0}
             max={100}
             value={advanced.maxInvalidRetries}
-            disabled={isStreaming || locked}
+            disabled={isCapturing || isStreaming || isStreamChanging || locked}
             onChange={(e) =>
               setAdvanced({ ...advanced, maxInvalidRetries: e.target.value })
             }
-            placeholder="3"
+            placeholder="0"
           />
+          <small>
+            RAW8: post-arm wait in ms. PG7: 10 ms ready-wait retry units.
+          </small>
         </div>
       </details>
 

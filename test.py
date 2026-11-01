@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import platform
+import os
 import shutil
 import subprocess
 import unittest
@@ -13,11 +14,14 @@ TEST_BUILD_DIR_NAME = "tests-pmw3610"
 
 
 def run_west(args: list[str]) -> subprocess.CompletedProcess[str]:
+    env = os.environ.copy()
+    env.setdefault("J", "1")
     return subprocess.run(
         ["west", *args],
         capture_output=True,
         text=True,
         cwd=THIS_DIR,
+        env=env,
     )
 
 
@@ -43,7 +47,9 @@ class WestCommandsTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.WEST_TOPDIR = Path(run_west(["topdir"]).stdout.strip())
-        cls.BUILD_DIR = cls.WEST_TOPDIR / "build"
+        cls.BUILD_DIR = Path(
+            os.environ.get("OWNER_TEST_OUTPUT", str(cls.WEST_TOPDIR / "build"))
+        ).resolve()
 
     @unittest.skipUnless(
         platform.system() == "Linux", "zmk-test is only supported on Linux"
@@ -208,7 +214,17 @@ class WestCommandsTests(unittest.TestCase):
         for artifact in artifacts_and_expected_build_params.keys():
             shutil.rmtree(self.BUILD_DIR / artifact, ignore_errors=True)
 
-        result = run_west(["zmk-build", "tests/zmk-config", "-q"])
+        result = run_west(
+            [
+                "zmk-build",
+                "tests/zmk-config",
+                "-q",
+                "--parallelism",
+                "1",
+                "--build-dir",
+                str(self.BUILD_DIR),
+            ]
+        )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
         for artifact, entries in artifacts_and_expected_build_params.items():

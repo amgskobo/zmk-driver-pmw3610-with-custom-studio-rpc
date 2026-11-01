@@ -1,4 +1,4 @@
-import { useContext, useEffect, useState } from "react";
+import { useContext, useEffect, useRef, useState } from "react";
 import {
   ZMKCustomSubsystem,
   ZMKAppContext,
@@ -36,6 +36,13 @@ const SOURCE_LOCAL = 0;
 
 type EditingValue = { key: string; text: string };
 
+interface SettingsSession {
+  retired: boolean;
+  generation: number;
+  busy: boolean;
+  cancelList?: () => void;
+}
+
 export interface SettingsPanelProps {
   /** True while ZMK Studio is locked -- disables all write/refresh
    * controls (the underlying RPC calls would fail with UNLOCK_REQUIRED
@@ -45,6 +52,8 @@ export interface SettingsPanelProps {
 
 export function SettingsPanel({ locked = false }: SettingsPanelProps = {}) {
   const zmkApp = useContext(ZMKAppContext);
+  const connection = zmkApp?.state.connection;
+  const sessionRef = useRef<SettingsSession | null>(null);
   const [settings, setSettings] = useState<Setting[]>([]);
   const [editing, setEditing] = useState<EditingValue | null>(null);
   const [writeMode, setWriteMode] = useState<SettingWriteMode>(
@@ -58,8 +67,26 @@ export function SettingsPanel({ locked = false }: SettingsPanelProps = {}) {
   );
   const pmw3610Subsystem = zmkApp?.findSubsystem("cormoran__pmw3610");
 
+  useEffect(() => {
+    const session: SettingsSession = {
+      retired: false,
+      generation: 0,
+      busy: false,
+    };
+    sessionRef.current = session;
+    // Settings/edit drafts belong to this external connection and lock lifetime.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    setSettings([]);
+    setEditing(null);
+    setIsLoading(false);
+    setStatusMessage(null);
+    return () => {
+      session.retired = true;
+      session.cancelList?.();
+    };
+  }, [connection, settingsSubsystem?.index, pmw3610Subsystem?.index, locked]);
+
   const callCustomRequest = async (request: Request): Promise<Response> => {
-    const connection = zmkApp?.state.connection;
     if (!connection || !settingsSubsystem) {
       throw new Error("Custom settings subsystem is not available");
     }
@@ -73,7 +100,15 @@ export function SettingsPanel({ locked = false }: SettingsPanelProps = {}) {
     return Response.decode(responsePayload);
   };
 
-  const loadSettings = async () => {
+  const loadSettings = async (afterMutation = false) => {
+    const session = sessionRef.current;
+    if (
+      !session ||
+      session.retired ||
+      locked ||
+      (session.busy && !afterMutation)
+    )
+      return;
     if (!zmkApp || !settingsSubsystem || pmw3610Subsystem === null) {
       return;
     }
@@ -81,6 +116,9 @@ export function SettingsPanel({ locked = false }: SettingsPanelProps = {}) {
       return;
     }
 
+    session.busy = true;
+    const generation = ++session.generation;
+    const current = () => !session.retired && generation === session.generation;
     setIsLoading(true);
     setStatusMessage(null);
 
@@ -110,6 +148,7 @@ export function SettingsPanel({ locked = false }: SettingsPanelProps = {}) {
       type: "custom",
       subsystemIndex: settingsSubsystem.index,
       callback: (customNotification) => {
+        if (!current() || isComplete) return;
         let notification;
         try {
           notification = SettingsNotification.decode(
@@ -123,23 +162,30 @@ export function SettingsPanel({ locked = false }: SettingsPanelProps = {}) {
             SettingNotificationKind.SETTING_NOTIFICATION_KIND_LIST_ITEM &&
           notification.setting.setting
         ) {
+          const item = notification.setting.setting;
           if (
-            notification.setting.setting.customSubsystemIndex ===
-            pmw3610Subsystem.index
-          ) {
-            collected.push(notification.setting.setting);
-          }
-          if (
-            expectedCount !== undefined &&
-            collected.length >= expectedCount
-          ) {
-            completeList();
-          } else {
-            scheduleQuietResolve();
+            item.customSubsystemIndex !== pmw3610Subsystem.index ||
+            item.source !== SOURCE_LOCAL
+          )
+            return;
+          const existing = collected.findIndex(
+            (setting) => setting.key === item.key
+          );
+          if (existing >= 0) collected[existing] = item;
+          else collected.push(item);
+          if (expectedCount !== undefined) {
+            if (collected.length >= expectedCount) completeList();
+            else scheduleQuietResolve();
           }
         }
       },
     });
+    const deadlineTimeout = setTimeout(completeList, LIST_REQUEST_TIMEOUT_MS);
+    session.cancelList = () => {
+      completeList();
+      unsubscribe();
+      clearTimeout(deadlineTimeout);
+    };
 
     try {
       const resp = await withTimeout(
@@ -157,26 +203,40 @@ export function SettingsPanel({ locked = false }: SettingsPanelProps = {}) {
         LIST_REQUEST_TIMEOUT_MS,
         "List request timed out"
       );
+      if (!current()) return;
       if (resp.error) {
         throw new Error(resp.error.message || "List failed");
       }
-      expectedCount = resp.status?.affectedCount ?? 0;
+      if (!resp.status) throw new Error("List response is missing its status");
+      expectedCount = resp.status.affectedCount;
       if (collected.length >= expectedCount) {
         completeList();
       } else {
         scheduleQuietResolve();
       }
       await listComplete;
+      if (!current()) return;
+      if (collected.length < expectedCount) {
+        throw new Error(
+          `Incomplete settings list: received ${collected.length} of ${expectedCount}`
+        );
+      }
       setSettings(collected);
       setStatusMessage(`Loaded ${collected.length} setting(s)`);
     } catch (error) {
+      if (!current()) return;
       setStatusMessage(
         `Failed to load settings: ${error instanceof Error ? error.message : "Unknown error"}`
       );
     } finally {
       unsubscribe();
       if (quietTimeout) clearTimeout(quietTimeout);
-      setIsLoading(false);
+      clearTimeout(deadlineTimeout);
+      if (current()) {
+        session.cancelList = undefined;
+        session.busy = false;
+        setIsLoading(false);
+      }
     }
   };
 
@@ -189,7 +249,7 @@ export function SettingsPanel({ locked = false }: SettingsPanelProps = {}) {
     void loadSettings();
     // Reload once the settings subsystems become available after connect.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [settingsSubsystem?.index, pmw3610Subsystem?.index]);
+  }, [connection, settingsSubsystem?.index, pmw3610Subsystem?.index, locked]);
 
   const startEditing = (setting: Setting) => {
     setEditing({ key: setting.key, text: formatEditableValue(setting) });
@@ -198,10 +258,15 @@ export function SettingsPanel({ locked = false }: SettingsPanelProps = {}) {
   const cancelEditing = () => setEditing(null);
 
   const writeSetting = async (setting: Setting) => {
+    const session = sessionRef.current;
+    if (!session || session.retired || session.busy || locked) return;
     if (!editing || editing.key !== setting.key || !pmw3610Subsystem) {
       return;
     }
 
+    session.busy = true;
+    const generation = ++session.generation;
+    const current = () => !session.retired && generation === session.generation;
     setIsLoading(true);
     setStatusMessage(null);
     try {
@@ -219,18 +284,23 @@ export function SettingsPanel({ locked = false }: SettingsPanelProps = {}) {
           },
         })
       );
+      if (!current()) return;
       if (resp.error) {
         throw new Error(resp.error.message);
       }
       setStatusMessage(`Wrote ${setting.key}`);
       setEditing(null);
-      await loadSettings();
+      await loadSettings(true);
     } catch (error) {
+      if (!current()) return;
       setStatusMessage(
         `Write failed: ${error instanceof Error ? error.message : "Unknown error"}`
       );
     } finally {
-      setIsLoading(false);
+      if (current()) {
+        session.busy = false;
+        setIsLoading(false);
+      }
     }
   };
 
@@ -238,8 +308,13 @@ export function SettingsPanel({ locked = false }: SettingsPanelProps = {}) {
     action: "saveSettings" | "discardSettings" | "resetSettings",
     label: string
   ) => {
+    const session = sessionRef.current;
+    if (!session || session.retired || session.busy || locked) return;
     if (!pmw3610Subsystem) return;
 
+    session.busy = true;
+    const generation = ++session.generation;
+    const current = () => !session.retired && generation === session.generation;
     setIsLoading(true);
     setStatusMessage(null);
     try {
@@ -253,19 +328,24 @@ export function SettingsPanel({ locked = false }: SettingsPanelProps = {}) {
           },
         })
       );
+      if (!current()) return;
       if (resp.error) {
         throw new Error(resp.error.message);
       }
       setStatusMessage(
         `${label}: ${resp.status?.affectedCount ?? 0} setting(s)`
       );
-      await loadSettings();
+      await loadSettings(true);
     } catch (error) {
+      if (!current()) return;
       setStatusMessage(
         `${label} failed: ${error instanceof Error ? error.message : "Unknown error"}`
       );
     } finally {
-      setIsLoading(false);
+      if (current()) {
+        session.busy = false;
+        setIsLoading(false);
+      }
     }
   };
 
@@ -323,7 +403,7 @@ export function SettingsPanel({ locked = false }: SettingsPanelProps = {}) {
         <select
           id="write-mode-select"
           value={writeMode}
-          disabled={locked}
+          disabled={isLoading || locked}
           onChange={(e) => setWriteMode(Number(e.target.value))}
         >
           <option value={SettingWriteMode.SETTING_WRITE_MODE_MEMORY}>
@@ -377,7 +457,7 @@ export function SettingsPanel({ locked = false }: SettingsPanelProps = {}) {
                       <input
                         aria-label={`${setting.key} value`}
                         value={editing.text}
-                        disabled={locked}
+                        disabled={isLoading || locked}
                         onChange={(e) =>
                           setEditing({ key: setting.key, text: e.target.value })
                         }

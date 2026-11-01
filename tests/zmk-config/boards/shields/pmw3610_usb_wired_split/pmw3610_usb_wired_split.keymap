@@ -8,7 +8,7 @@
 		default_layer {
 			bindings = <
 			&kp A &kp B
-			&kp C &kp D
+			&studio_unlock &kp D
 			>;
 		};
 	};

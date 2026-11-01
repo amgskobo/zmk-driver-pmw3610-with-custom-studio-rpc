@@ -24,9 +24,19 @@ export interface SourceInventory {
   devices: DeviceInfo[];
 }
 
+interface SensorSession {
+  retired: boolean;
+  infoGeneration: number;
+  diagnosticsGeneration: number;
+  diagnosticsBusy: boolean;
+  scanGeneration: number;
+  correlator: PeripheralResponseCorrelator;
+}
+
 export function SensorInfo() {
   const zmkApp = useContext(ZMKAppContext);
   const subsystem = zmkApp?.findSubsystem(PMW3610_SUBSYSTEM_IDENTIFIER);
+  const connection = zmkApp?.state.connection;
 
   const [devices, setDevices] = useState<DeviceInfo[]>([]);
   const [selectedDevice, setSelectedDevice] = useState(0);
@@ -45,31 +55,64 @@ export function SensorInfo() {
   const [inventory, setInventory] = useState<SourceInventory[] | null>(null);
   const [isScanning, setIsScanning] = useState(false);
 
-  const correlatorRef = useRef(new PeripheralResponseCorrelator());
+  const sessionRef = useRef<SensorSession | null>(null);
 
-  const callRequest = async (request: Request): Promise<Response> => {
-    const connection = zmkApp?.state.connection;
+  useEffect(() => {
+    const session: SensorSession = {
+      retired: false,
+      infoGeneration: 0,
+      diagnosticsGeneration: 0,
+      diagnosticsBusy: false,
+      scanGeneration: 0,
+      correlator: new PeripheralResponseCorrelator(),
+    };
+    sessionRef.current = session;
+    // Reset state owned by the previous external connection.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    setDevices([]);
+    setDiagnostics(null);
+    setInventory(null);
+    setIsScanning(false);
+    return () => {
+      session.retired = true;
+      session.correlator.clear("Connection changed or component unmounted");
+    };
+  }, [connection, subsystem?.index]);
+
+  const callRequest = async (
+    request: Request,
+    session: SensorSession
+  ): Promise<Response> => {
     if (!connection || !subsystem) {
       throw new Error("PMW3610 subsystem is not available");
     }
     const service = new ZMKCustomSubsystem(connection, subsystem.index);
     const payload = Request.encode(request).finish();
-    return callPmw3610Request(service, payload, correlatorRef.current);
+    return callPmw3610Request(service, payload, session.correlator);
   };
 
   const refreshInfo = async () => {
+    const session = sessionRef.current;
+    if (!session || session.retired) return;
+    const generation = ++session.infoGeneration;
+    const current = () =>
+      !session.retired && generation === session.infoGeneration;
     setIsLoading(true);
     setError(null);
     try {
-      const resp = await callRequest(Request.create({ getInfo: { source } }));
+      const resp = await callRequest(
+        Request.create({ getInfo: { source } }),
+        session
+      );
+      if (!current()) return;
       if (resp.error) {
         throw new Error(resp.error.message);
       }
       setDevices(resp.getInfo?.devices ?? []);
     } catch (e) {
-      setError(e instanceof Error ? e.message : "Unknown error");
+      if (current()) setError(e instanceof Error ? e.message : "Unknown error");
     } finally {
-      setIsLoading(false);
+      if (current()) setIsLoading(false);
     }
   };
 
@@ -78,12 +121,19 @@ export function SensorInfo() {
   // devices arrive afterwards as separate PeripheralResponse notifications
   // sharing relayRequestId, collected over a short window.
   const scanAllSources = async () => {
+    const session = sessionRef.current;
+    if (!session || session.retired) return;
+    const generation = ++session.scanGeneration;
+    const current = () =>
+      !session.retired && generation === session.scanGeneration;
     setIsScanning(true);
     setError(null);
     try {
       const resp = await callRequest(
-        Request.create({ getInfo: { source: PMW3610_SOURCE_ALL } })
+        Request.create({ getInfo: { source: PMW3610_SOURCE_ALL } }),
+        session
       );
+      if (!current()) return;
       if (resp.error) {
         throw new Error(resp.error.message);
       }
@@ -94,7 +144,8 @@ export function SensorInfo() {
       const relayRequestId = resp.getInfo?.relayRequestId ?? 0;
       if (relayRequestId) {
         const peripheralResults =
-          await correlatorRef.current.collectBroadcast(relayRequestId);
+          await session.correlator.collectBroadcast(relayRequestId);
+        if (!current()) return;
         for (const {
           source: peripheralSource,
           response,
@@ -110,19 +161,27 @@ export function SensorInfo() {
 
       setInventory(groups);
     } catch (e) {
-      setError(e instanceof Error ? e.message : "Unknown error");
+      if (current()) setError(e instanceof Error ? e.message : "Unknown error");
     } finally {
-      setIsScanning(false);
+      if (current()) setIsScanning(false);
     }
   };
 
   const refreshDiagnostics = async () => {
+    const session = sessionRef.current;
+    if (!session || session.retired || session.diagnosticsBusy) return;
+    session.diagnosticsBusy = true;
+    const generation = ++session.diagnosticsGeneration;
+    const current = () =>
+      !session.retired && generation === session.diagnosticsGeneration;
     try {
       const resp = await callRequest(
         Request.create({
           readDiagnostics: { deviceIndex: selectedDevice, source },
-        })
+        }),
+        session
       );
+      if (!current()) return;
       if (resp.error) {
         throw new Error(resp.error.message);
       }
@@ -130,7 +189,9 @@ export function SensorInfo() {
         setDiagnostics(resp.readDiagnostics);
       }
     } catch (e) {
-      setError(e instanceof Error ? e.message : "Unknown error");
+      if (current()) setError(e instanceof Error ? e.message : "Unknown error");
+    } finally {
+      if (current()) session.diagnosticsBusy = false;
     }
   };
 
@@ -139,34 +200,57 @@ export function SensorInfo() {
   // the correlator so callPmw3610Request()'s pending promise resolves.
   useEffect(() => {
     if (!zmkApp || !subsystem) return;
-    const correlator = correlatorRef.current;
+    const session = sessionRef.current;
+    if (!session) return;
+    let retired = false;
     const unsubscribe = zmkApp.onNotification({
       type: "custom",
       subsystemIndex: subsystem.index,
-      callback: (notification) =>
-        correlator.handleNotificationPayload(notification.payload),
+      callback: (notification) => {
+        if (!retired && !session.retired)
+          session.correlator.handleNotificationPayload(notification.payload);
+      },
     });
     return () => {
+      retired = true;
       unsubscribe();
-      correlator.clear("Subsystem changed or component unmounted");
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [zmkApp, subsystem?.index]);
+  }, [zmkApp, connection, subsystem?.index]);
 
   useEffect(() => {
+    const session = sessionRef.current;
+    if (!session) return;
+    session.diagnosticsGeneration++;
+    // Source changes retire the old target's display and pending reads.
+    session.diagnosticsBusy = false;
+    setDevices([]);
+    setSelectedDevice(0);
+    setDiagnostics(null);
     if (subsystem) {
       // Fire-and-forget: refreshInfo manages its own loading/error state
       // asynchronously. This effect only needs to kick it off once when the
       // subsystem becomes available (react-hooks/set-state-in-effect flags
       // the eventual setState inside refreshInfo, which is intentional
       // here -- there is no synchronous render-phase setState).
-      // eslint-disable-next-line react-hooks/set-state-in-effect
       void refreshInfo();
     }
+    return () => {
+      session.infoGeneration++;
+      session.diagnosticsGeneration++;
+    };
     // Reload when the subsystem becomes available or the target source
     // changes (switching which half's devices are shown).
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [subsystem?.index, source]);
+  }, [connection, subsystem?.index, source]);
+
+  useEffect(() => {
+    const session = sessionRef.current;
+    if (!session) return;
+    session.diagnosticsGeneration++;
+    session.diagnosticsBusy = false;
+    setDiagnostics(null);
+  }, [connection, subsystem?.index, source, selectedDevice]);
 
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   useEffect(() => {
@@ -181,7 +265,7 @@ export function SensorInfo() {
     }
     // Only depends on the toggle/device/subsystem, not the callback identity.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [autoRefresh, selectedDevice, source, subsystem?.index]);
+  }, [autoRefresh, selectedDevice, source, connection, subsystem?.index]);
 
   if (!zmkApp) return null;
 

@@ -40,9 +40,8 @@ LOG_MODULE_REGISTER(pmw3610, CONFIG_PMW3610_LOG_LEVEL);
 // ready-bit waits after arming (step 8's 0x47 bit1 and the first pixel's
 // 0x2D bit2): the ready bits update once per sensor frame, and a sensor
 // woken from Rest3 (500ms/frame) may need most of a full rest-frame
-// interval before the force-run PERFORMANCE write takes effect. Measured
-// during Phase D hardware validation: the first capture after boot timed
-// out with only the per-pixel budget. 70 units = 700ms covers one full
+// interval before the force-run PERFORMANCE write takes effect.
+// 70 units = 700ms covers one full
 // Rest3 frame plus margin; once running, pixels advance at run-mode frame
 // rate and the (much smaller) per-pixel budget applies.
 #define PMW3610_FRAME_CAPTURE_STARTUP_WAIT_RETRIES 70
@@ -62,12 +61,11 @@ LOG_MODULE_REGISTER(pmw3610, CONFIG_PMW3610_LOG_LEVEL);
 // Unconditional wall-clock bound on the whole procedure so a caller on the
 // Studio RPC thread can never be blocked indefinitely by a misbehaving
 // sensor. Independent of pixel_count / wait retries -- whichever bound is
-// hit first wins. Typical complete captures are far faster (measured
-// during Phase D hardware validation).
+// hit first wins.
 #define PMW3610_FRAME_CAPTURE_TIMEOUT_MS 5000
 
 //////// Burst frame capture (FRAME_GRAB, register 0x36) defaults //////////
-// See DESIGN.md Phase G / docs/pmw3610.md "Frame Capture burst" (method 1)
+// See DESIGN.md Phase G, "Burst frame capture" (method 1)
 // and the reference Arduino sketch
 // (trackball-frame-visualizer/.../xiao_nRF52840_pmw3610_burst.ino). Used
 // only when `!config->disable_burst_read` (4-wire wiring, dedicated
@@ -88,12 +86,9 @@ LOG_MODULE_REGISTER(pmw3610, CONFIG_PMW3610_LOG_LEVEL);
 // Wait after arming FG_EN for one fresh frame to latch before the burst
 // read. This is the driver default when the request does not override it
 // (see the max_invalid_retries reinterpretation in
-// pmw3610_frame_capture_read()). Hardware validation (DESIGN.md G.6) swept
-// this on real hardware: coherent full frames hold down to 4ms (~78 fps),
-// but 3ms and below intermittently stream stale/garbled frames (still
-// reported complete). 5ms (~72 fps streaming) keeps one step of margin
-// above that 4ms boundary against sensor/scene/temperature variation. The
-// Arduino reference uses a more conservative fixed 10ms.
+// pmw3610_frame_capture_read()). The default does not establish a coherent
+// frame-rate guarantee; validate overrides on the selected sensor and
+// transport (DESIGN.md G.6).
 #define PMW3610_FRAME_CAPTURE_BURST_POST_ARM_WAIT_MS 5
 // Clamp range for the request-supplied post-arm wait override.
 #define PMW3610_FRAME_CAPTURE_BURST_POST_ARM_WAIT_MAX_MS 100
@@ -162,13 +157,8 @@ static int pmw3610_read_reg(const struct device *dev, uint8_t addr, uint8_t *val
     return pmw3610_read(dev, addr, value, 1);
 }
 
-/* Max bytes per SPI sub-transfer for the burst frame read. The nRF SPIM
- * EasyDMA truncates a single transfer at 255 bytes on this SoC even though
- * the devicetree advertises 16-bit MAXCNT -- measured on hardware
- * (DESIGN.md Phase G.6): a one-shot 484-byte read returns real data only
- * through offset 254 and silently zero-fills the rest, with the cutoff at a
- * fixed absolute offset of 255 independent of the requested length. Staying
- * safely under 255 per sub-transfer avoids it. */
+/* Keep each SPI sub-transfer below the nRF SPIM 255-byte EasyDMA limit.
+ * Split the full frame into descriptors within the same CS-held transfer. */
 #define PMW3610_BURST_MAX_XFER 240U
 /* 8 * 240 = 1920 px, well above the 484-pixel full frame -- an upper bound
  * so the rx descriptor array can live on the stack. */
@@ -1307,7 +1297,7 @@ static void pmw3610_capture_frame_recover_locked(const struct device *dev) {
  * 10ms and verify again"; polling finer than 10ms is harmless (just more
  * SPI reads) and matters for throughput: the pixel-ready bit updates once
  * per sensor frame (< 10ms in forced run mode), so 10ms sleep quantization
- * would cost ~10ms/pixel (~4.8s per full frame, measured), while 1ms
+ * can add up to 10ms per pixel, while 1ms
  * polling tracks the actual frame period. Returns 0 when the bit is set,
  * -ETIMEDOUT when the budget/deadline is exhausted, or a negative SPI
  * errno. */
@@ -1339,8 +1329,7 @@ static int pmw3610_capture_wait_bit(const struct device *dev, uint8_t reg, uint8
  * Force run mode for the duration of the capture: the OBSERVATION1 bits
  * used as the per-pixel ready handshake are "set every frame" (datasheet),
  * so the pixel cadence is the sensor's frame rate. A stationary sensor
- * downshifts to Rest3 (~500ms/frame -- measured ~433ms/pixel during Phase D
- * hardware validation, i.e. ~4 minutes for a full 484-pixel frame). Setting
+ * downshifts to Rest3 (500ms/frame at the default sample time). Setting
  * PERFORMANCE bits[7:4] = 0xF (force awake, same write
  * pmw3610_set_performance() uses) keeps the sensor in Run mode; the
  * post-capture power-up reset restores the register.
@@ -1350,9 +1339,8 @@ static int pmw3610_capture_wait_bit(const struct device *dev, uint8_t reg, uint8
  * OBSERVATION1 (any write clears its bits), then wait for the frame bits to
  * repopulate with the MODE bits (bits[7:6]) showing Run (00). Arming while
  * the sensor is still in a rest mode makes the per-pixel ready bit follow
- * the (much slower) rest frame cadence -- measured 30ms-budget misses in
- * Rest1 (40ms/frame) and full-startup timeouts from Rest2/3 during Phase D
- * hardware validation.
+ * the slower rest frame cadence, potentially exhausting the run-mode
+ * ready-wait budget.
  *
  * Returns 0 on success, -ETIMEDOUT if the mode switch never landed within
  * `deadline`, or a negative SPI errno. */
@@ -1714,8 +1702,7 @@ int pmw3610_capture_frame(const struct device *dev,
     err = pmw3610_frame_capture_read(dev, params, buf, buf_len, result);
     /* read() set duration_ms to just its own elapsed time; overwrite with
      * the total begin()+read() elapsed time (still excluding end()'s
-     * reset, same as the pre-Phase-G contract, which measured up to the
-     * completion check and not the recovery that follows it). */
+     * reset). The reported duration ends at the completion check. */
     result->duration_ms = (uint32_t)(k_uptime_get() - start);
     /* Always end the session on the way out (mirrors the pre-Phase-G
      * "always recover" behavior), regardless of read()'s outcome -- a

@@ -148,6 +148,17 @@ config ZMK_PMW3610_SPLIT_RPC_RELAY
       well with a UI that only expects an answer from a specific one. Safe
       to enable for a build with a single peripheral.
 
+config ZMK_PMW3610_RELAY_QUEUE_DEPTH
+    int "PMW3610 relay packets per queue"
+    depends on ZMK_PMW3610_SPLIT_RPC_RELAY
+    default 8
+    range 4 32
+    help
+      Bounded queues preserve packet order while the low-priority worker is
+      busy. The central has separate response and notification queues; the
+      peripheral has a request queue. An incoming packet is dropped with a
+      warning when its queue is full. Stream retirement bypasses these queues.
+
 config ZMK_PMW3610_SPLIT_RPC_RELAY_TEST
     bool "Enable native_sim-only PMW3610 split relay test hooks"
     depends on ZMK_PMW3610_SPLIT_RPC_RELAY

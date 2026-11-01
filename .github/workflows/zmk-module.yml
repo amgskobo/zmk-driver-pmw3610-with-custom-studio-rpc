@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - main
+      - codex/pmw3610-driver-review
     paths-ignore:
       - "**/*.md"
       - .github/workflows/copilot-setup-steps.yml
@@ -41,9 +42,12 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 45
     container:
-      image: zmkfirmware/zmk-build-arm:stable
+      image: zmkfirmware/zmk-build-arm@sha256:edb1c953438c6f720ddb79c3762f3972013b7fbbaf4fff3592fc869983e7afc5
+      options: --cpus 2 --memory 4g
+    env:
+      CMAKE_BUILD_PARALLEL_LEVEL: 2
     name: Build
     steps:
       - name: Checkout
@@ -64,7 +68,10 @@ jobs:
     # first run) + booting the emulator takes longer than a plain build.
     timeout-minutes: 20
     container:
-      image: zmkfirmware/zmk-build-arm:stable
+      image: zmkfirmware/zmk-build-arm@sha256:edb1c953438c6f720ddb79c3762f3972013b7fbbaf4fff3592fc869983e7afc5
+      options: --cpus 2 --memory 4g
+    env:
+      CMAKE_BUILD_PARALLEL_LEVEL: 2
     name: Renode PMW3610 Test
     steps:
       - name: Checkout
@@ -75,25 +82,36 @@ jobs:
         # Studio); see tests/zmk-config/build-renode.yaml. Writes build/renode/.
         run: >-
           west zmk-build tests/zmk-config
-          --build-yaml tests/zmk-config/build-renode.yaml -af renode
-      # zmk-west-commands' composite action wraps the Renode cache + install
-      # and the `west zmk-renode-test` run (it does not build -- that's the
-      # step above). Default `ble` host-link with no host-elf degrades to a
-      # boot-liveness smoke, which this console-only image passes; then it runs
-      # the module's tests/renode/*_test.py: the sensor test boots its own resc
-      # with the simulated PMW3610 (the relay test self-skips, no peripheral ELF).
-      - name: Run Renode PMW3610 test
-        uses: cormoran/zmk-west-commands/.github/actions/zmk-renode-test@main
+          --build-yaml tests/zmk-config/build-renode.yaml -af renode --parallelism 1
+      - name: Cache Renode install
+        uses: actions/cache@v4
         with:
-          elf-path: build/renode/zephyr/zmk.elf
-          tests: tests/renode
+          path: ~/.renode
+          key: renode-1.16.1-${{ runner.os }}
+      - name: Prepare Renode test environment
+        run: |
+          if ! python3 -c 'import google.protobuf' || ! command -v protoc; then
+            apt-get update -y
+            apt-get install -y --no-install-recommends python3-protobuf protobuf-compiler
+          fi
+          python3 tools/renode_core.py prepare --cache "$RUNNER_TEMP/pmw-renode-core" --jobs 2
+      - name: Run Renode PMW3610 test
+        # This console-only image uses the module's sensor platform. The
+        # generic smoke has no sensor and is not this image's acceptance test.
+        run: >-
+          python3 tools/renode_core.py run --cache "$RUNNER_TEMP/pmw-renode-core" --
+          west zmk-renode-test tests/renode
+          --elf build/renode/zephyr/zmk.elf --renode-version 1.16.1 --skip-smoke
 
   renode-relay-test:
     runs-on: ubuntu-latest
     # Two real images booted on one Renode session + the Renode install.
     timeout-minutes: 20
     container:
-      image: zmkfirmware/zmk-build-arm:stable
+      image: zmkfirmware/zmk-build-arm@sha256:edb1c953438c6f720ddb79c3762f3972013b7fbbaf4fff3592fc869983e7afc5
+      options: --cpus 2 --memory 4g
+    env:
+      CMAKE_BUILD_PARALLEL_LEVEL: 2
     name: Renode PMW3610 wired-split relay test
     steps:
       - name: Checkout
@@ -104,21 +122,29 @@ jobs:
         # PMW3610; see tests/zmk-config/build-usb-split.yaml.
         run: >-
           west zmk-build tests/zmk-config
-          --build-yaml tests/zmk-config/build-usb-split.yaml -af usb-wired-central &&
+          --build-yaml tests/zmk-config/build-usb-split.yaml -af usb-wired-central --parallelism 1 &&
           west zmk-build tests/zmk-config
-          --build-yaml tests/zmk-config/build-usb-split.yaml -af usb-wired-peripheral
-      # Same composite action in wired-split mode: its smoke round-trips a core
-      # Studio GetDeviceInfo over the central's USB CDC + a peripheral keypress
-      # over the wired link, then tests/renode runs the split-relay round-trip
-      # (tests/renode/pmw3610_usb_wired_split_relay_renode_test.py; the
-      # single-board sensor test self-skips on a split run).
-      - name: Run split-relay round-trip test
-        uses: cormoran/zmk-west-commands/.github/actions/zmk-renode-test@main
+          --build-yaml tests/zmk-config/build-usb-split.yaml -af usb-wired-peripheral --parallelism 1
+      - name: Cache Renode install
+        uses: actions/cache@v4
         with:
-          mode: wired-split
-          elf-path: build/usb-wired-central/zephyr/zmk.elf
-          peripheral-elf: build/usb-wired-peripheral/zephyr/zmk.elf
-          tests: tests/renode
+          path: ~/.renode
+          key: renode-1.16.1-${{ runner.os }}
+      - name: Prepare Renode test environment
+        run: |
+          if ! python3 -c 'import google.protobuf' || ! command -v protoc; then
+            apt-get update -y
+            apt-get install -y --no-install-recommends python3-protobuf protobuf-compiler
+          fi
+          python3 tools/renode_core.py prepare --cache "$RUNNER_TEMP/pmw-renode-core" --jobs 2
+      - name: Run split-relay round-trip test
+        # Keep the three generic wired smoke checks as well as the module tests.
+        run: >-
+          python3 tools/renode_core.py run --cache "$RUNNER_TEMP/pmw-renode-core" --
+          west zmk-renode-test --mode wired-split
+          --elf build/usb-wired-central/zephyr/zmk.elf
+          --peripheral-elf build/usb-wired-peripheral/zephyr/zmk.elf
+          tests/renode --renode-version 1.16.1
 
   keepalive:
     if: github.event_name == 'schedule'

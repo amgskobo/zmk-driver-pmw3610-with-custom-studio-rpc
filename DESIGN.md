@@ -218,12 +218,8 @@ duplicate it.
 
 ## Frame capture
 
-The Phase C implementation guessed a "common PixArt pixel-grab convention"
-(write `PIXEL_GRAB` = 0x00, poll bit7) because only the 8-page public
-datasheet was available; Phase D hardware validation showed PG_Valid never
-asserts with that sequence. The full PMW3610 datasheet (R2.4, PIXEL_GRAB
-register usage section) documents the official `Pixel_Grab` procedure,
-which Phase D implemented and validated on hardware:
+The per-pixel fallback follows the PMW3610 datasheet's `Pixel_Grab`
+procedure (R2.4, PIXEL_GRAB register usage section):
 
 1. Write `0x41` = `0xBA` (SPI clock on request)
 2. Write `0x7F` = `0xFF` (select page 1)
@@ -404,7 +400,7 @@ Implemented in Phase C as four cards plus the connection card:
 ## Test config (tests/zmk-config)
 
 - board `xiao_ble//zmk`, shield `tester_xiao`, snippet `studio-rpc-usb-uart`.
-- Overlay (from zmk-keyboard-dya2 right-trackball, user's wiring):
+- Synthetic test overlay:
   - spi0 pinctrl: SCK = P0.05 (D5), MOSI = MISO = P1.13 (D8, 3-wire shared)
   - CS = `&xiao_d 10`, IRQ = `&xiao_d 9` (active low, pull-up)
   - `cormoran,pmw3610`, `spi-max-frequency = <2000000>`
@@ -523,10 +519,10 @@ is active; `SetFrameStream(enable=true)` validates `device_index` up front
 (same bounds check as other handlers) so an invalid target fails immediately
 instead of spinning.
 
-Given the sensor takes ~2s per 484-pixel frame (measured in Phase D) and
-frame capture inherently blocks normal cursor movement while it runs, "as
-fast as possible" back-to-back capture already self-paces streaming to
-~0.4-0.5 fps; document this in README as a hardware limitation, not a bug.
+Frame capture interrupts normal motion reporting. The per-pixel fallback
+waits for each sensor handshake; burst mode reads the array in one CS-held
+transaction. Neither path establishes a frame-rate guarantee without
+measurement on the selected hardware and transport.
 
 ### Validating a physical-unlock-only security model without a human present
 
@@ -566,9 +562,8 @@ Everything below was design; implementation status per stage (F.6):
   plus an ELF-symbol assertion in `test.py` proving two independent
   `zmk_custom_setting` entry sets get generated with no symbol collisions;
   `west zmk-test` (native_sim, zero devices) and web unit
-  tests/lint/build all still pass. Not yet hardware-validated (this
-  environment has no PMW3610 sensor attached — see "Hardware validation
-  status" below); README updated.
+  tests/lint/build cover the software path. Hardware acceptance requires
+  the separate checks below.
 - **F-b + F-c (relay proto/Kconfig scaffolding, handler-to-executor
   refactor, peripheral executor, central bridge for non-frame RPCs) —
   implemented.** `GetInfoRequest`/`ReadDiagnosticsRequest`/
@@ -753,67 +748,19 @@ Everything below was design; implementation status per stage (F.6):
   nobody answers, doesn't double-consume with a concurrent `waitFor()`);
   `npm test`/`lint`/`build` all still pass.
 
-### Hardware validation status (2026-07)
+### Relay execution and validation requirements
 
-Confirmed end-to-end on real hardware (2 physical XIAO nRF52840 boards, one
-with a real PMW3610 sensor wired as the split peripheral, one as split
-central, both over a real BLE split link): a Studio RPC `GetInfo{source: 1}`
-sent to the central's `cormoran__pmw3610` subsystem returns an immediate
-`DeferredResponse`, the peripheral executes the relayed request against its
-real local PMW3610 (`product_id: 62` / 0x3E, `ready: true`, full
-`runtime_config`), and the central re-raises the relayed `RelayResponse` as
-a `PeripheralResponse` Studio notification carrying that real device data
-back to the client — the full round trip this design's relay bridge exists
-for.
+Relay decode/execute/encode and frame capture run on ZMK's dedicated
+low-priority workqueue, rather than inline in system-workqueue callbacks.
+`CONFIG_ZMK_PMW3610_PROTOBUF` selects `ZMK_LOW_PRIORITY_WORK_QUEUE`; the
+split-relay snippet provides a 4096-byte low-priority stack for the nested
+protobuf operations. The listeners copy event data before deferring it.
 
-Getting there surfaced a real firmware bug, since fixed (see below): the
-peripheral's relay-request executor originally ran synchronously on
-whichever thread ZMK core's split relay dispatch happened to use (the
-system workqueue on both roles), and with this subsystem's ~230-byte
-relayed messages that call chain (decode → `pmw3610_request_exec_handle()`
-→ nanopb-encode → ZMK core's own relay-out path) overflowed the default
-2048-byte system workqueue stack — an MPU fault / stack overflow, confirmed
-via RTT, that silently killed the response before it ever reached central
-(the request-side `DeferredResponse` still came back fine, since that part
-completes before the crash). Fixed by moving every relay listener in
-`src/split/pmw3610_relay.c`, plus frame streaming's capture loop in
-`src/studio/pmw3610_request_exec.c` (same system-workqueue exposure, worse
-in degree since it blocks for ~2s per captured frame), off the system
-workqueue entirely and onto ZMK core's own dedicated low-priority workqueue
-(`zmk_workqueue_lowprio_work_q()`, `app/src/workqueue.c` — the same queue
-ZMK core itself uses for GATT notify work in `gatt_rpc_transport.c`, for the
-identical reason). Each listener now copies its event payload into a static
-buffer and submits a `k_work` item to that queue instead of processing
-inline; `CONFIG_ZMK_PMW3610_PROTOBUF` now `select`s
-`ZMK_LOW_PRIORITY_WORK_QUEUE`, and the split-rpc-relay snippet sizes
-`CONFIG_ZMK_LOW_PRIORITY_THREAD_STACK_SIZE=4096` for it. This is strictly
-better than the system-workqueue-stack-size band-aid it replaces: the low
-priority queue's stack is dedicated to latency-tolerant, deliberately
-deferred work, so sizing it for this subsystem's worst case doesn't bloat
-every other system workqueue consumer's headroom requirement, and a slow
-protobuf pass (or frame streaming's capture loop) can no longer block
-unrelated system workqueue work (BLE housekeeping, HID reports,
-keyscan-deferred work, ...) system-wide.
-
-Also confirmed while debugging the above: repeatedly halting either board's
-CPU via J-Link (e.g. for RTT log capture) while its BLE softdevice link is
-live is itself capable of destabilizing the connection (observed as a
-kernel oops / an apparent reconnect stall on the central) — a rig/tooling
-caveat for future hardware sessions on this or any BLE-softdevice-based
-board, not a firmware bug. Reading RTT logs without first zeroing the
-`_SEGGER_RTT` control block's signature (forcing a fresh `WrOff`/`RdOff` on
-next boot) is also unreliable across resets/reflashes: the ring buffer
-retains stale bytes from earlier sessions at offsets the current session
-hasn't reached yet, which briefly looked like a *recurring* crash before
-this was understood to be one stale capture read twice.
-
-Not yet exercised on hardware: a real sensor's persisted `cpi@<id>` value
-across reboot, more than one PMW3610 on the same half, a real
-`SetFrameStream` from a peripheral driven from the web UI's "Split source"
-input, and `GetInfo{source: PMW3610_SOURCE_ALL}`'s broadcast-across-every-
-peripheral path (F-f) with more than one peripheral attached. Re-run the
-"Validation plan (hardware)" steps below for those once a second peripheral
-or a persisted-settings scenario is available.
+Build and emulator checks do not establish real split delivery, sensor
+timing, persistence across reboot, or recovery after streaming. Validate
+those boundaries on the selected devices using the hardware plan below.
+Keep individual device identifiers and measurement histories in local
+validation records rather than this public design document.
 
 Facts about the dependencies below were verified against the checked-out
 sources (paths cited).
@@ -983,9 +930,11 @@ reference implementation to copy):
   core, e.g. `src/studio/pmw3610_request_exec.c`, so central RPC and
   peripheral relay share one implementation), encodes the `Response` into a
   `RelayResponse`, raises it with `source = ZMK_RELAY_EVENT_SOURCE_SELF` for
-  relaying up. Executor work runs on the system workqueue (frame capture
-  blocks up to ~5s — must not run in the BLE RX path; a 1-deep pending-work
-  model with "busy" `ErrorResponse` for overlapping requests is enough).
+  relaying up. Executor work runs on the dedicated low-priority workqueue.
+  Bounded FIFO queues own each request/response/chunk until consumption;
+  repeated work submissions cannot overwrite a queued payload. Queue overflow
+  drops the incoming packet with a warning. A separate stop control retires
+  peripheral requests without waiting behind a blocking sensor capture.
 - **Central bridge** (`src/split/pmw3610_relay_central.c`): forwards
   peripheral-targeted requests; on `zmk_pmw3610_relay_response`, wraps the
   decoded payload in `PeripheralResponse{source = ev.source}` and raises it
@@ -1022,7 +971,8 @@ reference implementation to copy):
     (peripheral enforces locally), but the *central* additionally tracks a
     single global active stream target to keep UI semantics identical.
   - **Lock/disconnect stops**: central's existing lock listener additionally
-    relays `SetFrameStream{enable:false}` to the streaming peripheral;
+    sends the `pms` stop control to the peripherals, retires queued/late
+    responses and blocks image forwarding until a new authorized start;
     the peripheral independently force-stops its stream when the split link
     drops (its `zmk_split_peripheral_status_changed` listener) — covers the
     "central rebooted / out of range while streaming" hole.
@@ -1132,48 +1082,35 @@ reference implementation to copy):
 5. Exercise `ReadDiagnostics`/`ReadRegister`/`WriteRegister` against a real
    device (index bounds, register 0x85 RES_STEP round trip, error path for
    an out-of-range device_index).
-6. `CaptureFrame` + `GetFrameChunk` (primary Phase D task -- done) →
-   Phase D found the Phase C guessed procedure never asserts PG_Valid;
-   replaced with the official datasheet (R2.4) Pixel_Grab sequence (see
-   "Frame capture" above) and validated on hardware: assembled frames,
-   checked `complete`/PG_Valid, confirmed the 484 = 22x22 array size
-   (datasheet Figure 17). Example CLI JSON request/response shapes are in
-   README.md's "Frame capture" section.
+6. Exercise `CaptureFrame` + `GetFrameChunk`: assemble the requested
+   pixels, check `complete` and the format-specific validity rules, and
+   verify navigation resumes after capture and after stopping a stream.
+   Example request/response shapes are in README.md's "Frame capture"
+   section.
 7. Web UI smoke test (vite dev + Chrome WebSerial) if environment allows;
    otherwise CLI-driven equivalent via `custom-call`. In particular verify
-   the Frame Viewer's streaming loop against real RPC round-trip latency
-   (the web-side "streaming" is a sequential capture loop with no fixed
-   interval, so FPS is bounded entirely by hardware/RPC speed, not
-   simulated in any test so far).
+   notification-based frame streaming against real transport latency.
 
 ## Phase G: fast burst frame capture (maximize frame rate)
 
 ### G.0 Problem — two multiplicative bottlenecks
 
-The Phase D/E frame path is ~0.4–0.5 fps. Two independent causes stack:
+The earlier per-pixel path had two sources of latency:
 
 1. **Per-pixel `PIXEL_GRAB` read.** `pmw3610_capture_frame()` reads all 484
    pixels one register at a time (steps 9–11 of the datasheet Pixel_Grab
    loop), and each pixel blocks until `OBSERVATION1` (0x2D) bit2 reasserts —
-   once per sensor frame (~4 ms in forced run mode). ~484 × ~4 ms ≈ **~2 s
-   per frame**, purely on the sensor side.
+   once per sensor frame. Capturing the array therefore requires a series
+   of sensor handshakes.
 2. **Full sensor reset between every frame.** `pmw3610_capture_frame()`
    unconditionally runs `pmw3610_capture_frame_recover_locked()` on exit — a
    power-up reset + the whole staged async re-init (`async_init_delay[]`
    sleeps). For a one-shot capture that is correct (navigation must resume).
    But the streaming loop calls `pmw3610_capture_frame()` per frame, so it
-   pays a **complete sensor re-init on every streamed frame**, on top of the
-   ~2 s. This dominates streaming.
+   pays a **complete sensor re-init on every streamed frame**.
 
-The repo already documents the fast alternative it never wired up:
-`docs/pmw3610.md` "Frame Capture burst" (method 1) and the reference Arduino
-sketch (`trackball-frame-visualizer/.../xiao_nRF52840_pmw3610_burst.ino`),
-which pulls a full 484-byte frame in **one** burst SPI transaction and never
-resets between frames.
-
-Two fixes, multiplicative: **G.1** replaces per-pixel read with a burst read;
-**G.2** removes the per-frame reset via a persistent capture mode. Target: two
-to three orders of magnitude — tens of fps, sensor-limited.
+**G.1** replaces per-pixel reads with one CS-held burst transaction;
+**G.2** removes the per-frame reset through a persistent capture session.
 
 Scope decisions (confirmed with the maintainer):
 - **4-wire burst only.** The burst path requires a real burst read (dedicated
@@ -1185,9 +1122,8 @@ Scope decisions (confirmed with the maintainer):
   paths (the streaming handler is path-agnostic), so the 3-wire fallback also
   now resets once per session rather than per frame. That is logically sound
   (the datasheet reset is only needed to *resume navigation*, which happens
-  once at `end()`), but is unvalidated on 3-wire hardware — the validation
-  rig (G.6) is 4-wire-burst. The read algorithm being untouched bounds the
-  risk.
+  once at `end()`). The acceptance plan must cover each wiring mode
+  separately (G.6).
 - **USB transport.** Streaming is consumed over USB CDC-ACM, which is far
   faster than a BLE connection interval, so the transport is *not* the
   bottleneck after G.1/G.2. We therefore do **not** add reduced-resolution
@@ -1309,54 +1245,18 @@ overhead but are a measured G.6 follow-up, not assumed.
   fallback. Verify both still build and that `test.py` asserts the feature is
   enabled.
 
-### G.6 Hardware validation (maximize fps — the actual goal) — DONE
+### G.6 Hardware acceptance plan
 
-Validated 2026-07-06 on the XIAO nRF52840 rig (board `0C5B206D3B120A9F`,
-J-Link `1050398082`), `pmw3610_rpc` build over USB Studio RPC. Results:
+The implementation splits a burst into at most 240-byte transfers while
+holding CS across the full transaction, and reports burst pixels as RAW8.
+The post-arm wait defaults to 5 ms and is configurable; this is a software
+default, not a validated minimum or a throughput guarantee.
 
-1. **Byte format = RAW8.** Burst bytes never set bit7; all 484 are pixel
-   data. Settles G.1's caveat and G.4's enum: burst reports
-   `PIXEL_FORMAT_RAW8`, the web renders it as full 8-bit (no PG_VALID bit).
-2. **The nRF SPIM 255-byte EasyDMA cap (the one real bug found).** A single
-   484-byte burst transfer silently returned data only through offset 254 and
-   zero-filled 255..483 — a *fixed absolute* cutoff at 255 independent of
-   requested length (an earlier "228" reading was a dim-scene artifact),
-   despite the DT advertising `easydma-maxcnt-bits = 16`. Fix (`420a8aa`):
-   split the destination into ≤240-byte rx buffers within one CS-held
-   `spi_transceive` so the driver issues back-to-back EasyDMA transfers
-   without releasing NCS (the sensor's frame pointer only advances while NCS
-   stays low). After the fix: full 484 px, coherent 22×22 image
-   (adjacent-pixel correlation ≈ 0.74–0.79), no cutoff/garbage. This was a
-   DMA limit, *not* a 3-wire electrical limit.
-3. **Post-arm wait swept → fps ceiling.** Made the wait tunable per capture
-   (`a0c20d5`; `max_invalid_retries` reinterpreted as ms in burst mode) and
-   swept it under continuous streaming, scoring each frame's coherence
-   against a reference scene (not post-disable one-shots, which get extra
-   settle time from RPC round-trips and mislead):
-
-   | post-arm wait | streaming fps | coherent + complete? |
-   |---|---|---|
-   | 10 ms | ~53 | yes |
-   | 5 ms  | ~72 | yes (shipped default — one step of margin) |
-   | 4 ms  | ~78 | yes (measured coherent floor) |
-   | ≤3 ms | 84–102 | NO — a fraction of frames stream stale/garbled while still reporting `complete=true` |
-
-   Shipped default **5 ms (~72 fps)**; the runtime knob lets callers push to
-   4 ms or trade back toward reliability. **Net: ~0.4 fps → ~72 fps (~180×).**
-   The arm-once-vs-re-arm experiment (G.2) was left as-is (re-arm per frame,
-   matching the Arduino reference) — 72 fps already far exceeds the frame
-   viewer's needs, and re-arm is the proven-correct sequence.
-4. **Navigation recovery.** After every `SetFrameStream(false)` the stream
-   stops cleanly (0 further chunks) and `GetInfo.ready` returns true with
-   plausible `ReadDiagnostics` — the single `end()` reset restores the sensor.
-   (Direct X/Y-motion confirmation needs a human to physically move the ball;
-   not scriptable here — `ready`/diagnostics is the automated proxy.)
-5. **Not validated on hardware:** the 3-wire `disable_burst_read` per-pixel
-   fallback (the rig is 4-wire burst) — its read algorithm is byte-for-byte
-   unchanged, only the reset cadence became once-per-session (see G.0). And a
-   rig quirk, not a firmware issue: the CDC-ACM tty node flaked after reflash
-   (a second XIAO shares the `1d50:615e` VID:PID); the serial-filtered pyusb
-   transport was the reliable driver.
+For each supported wiring and transport, verify all requested pixels are
+present, inspect coherence during continuous streaming, and confirm normal
+motion resumes after stopping. Check lock, disconnect, capture failure and
+split-peripheral recovery. Record exact device identities and measured
+results locally; publish only an appropriately reviewed technical account.
 
 ### G.7 Implementation order (per Dev Rules: proto → firmware → web → test)
 
@@ -1366,5 +1266,4 @@ J-Link `1050398082`), `pmw3610_rpc` build over USB Studio RPC. Results:
 - **G-c** request_exec: stream handler → begin/read/end + notify back-pressure.
 - **G-d** web: format-aware rendering + README fps update.
 - **G-e** unit + build tests.
-- **G-f** hardware validation + fps tuning (G.6); fold results back into
-  `docs/pmw3610.md` and this section.
+- **G-f** hardware acceptance and timing checks (G.6), recorded separately.

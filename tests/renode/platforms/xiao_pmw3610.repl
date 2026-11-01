@@ -69,7 +69,9 @@ trackball: SPI.PMW3610 @ spi0
 spi2: SPI.NRF52840_SPI @ sysbus 0x40023000
     -> nvic@0x23
 
-gpio0: GPIOPort.NRF52840_GPIO @ sysbus 0x50000500
+// gpio0 also needs LATCH for the direct-scan keys: their level-triggered
+// interrupts use the same nrfx PORT-event path as the motion input.
+gpio0: GPIOPort.NRF52840_GPIO_WithLatch @ sysbus 0x50000500
 
 // gpio1 carries the sensor's level-triggered motion IRQ (P1.14), so it needs
 // a working LATCH register -- see NRF52840_GPIO_WithLatch.cs.

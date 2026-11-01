@@ -20,7 +20,8 @@ runs:
     - name: Init
       run: |
         git config --global --add safe.directory ${{ github.workspace }}
-        west init -l west --mf "${{ env.WEST_MANIFEST_FILE }}"
+        python3 tools/verify_review_dependencies.py
+        west init -l west --mf "$WEST_MANIFEST_FILE"
         west update --narrow
         west zephyr-export
       env:

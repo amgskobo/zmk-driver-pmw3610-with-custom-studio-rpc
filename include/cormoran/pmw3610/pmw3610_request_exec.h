@@ -63,6 +63,10 @@ bool pmw3610_request_exec_handle(const cormoran_pmw3610_Request *req,
  */
 uint32_t pmw3610_request_get_source(const cormoran_pmw3610_Request *req);
 
+/* Retire a stream immediately; its worker ends the owned sensor session.
+ * Safe from a lock/disconnect listener while begin/read is in progress. */
+void pmw3610_request_stop_stream(void);
+
 #ifdef __cplusplus
 }
 #endif

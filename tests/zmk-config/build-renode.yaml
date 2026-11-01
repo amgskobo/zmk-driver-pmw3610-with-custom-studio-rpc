@@ -13,7 +13,8 @@
 #   west zmk-build tests/zmk-config --build-yaml tests/zmk-config/build-renode.yaml -af renode
 # then run the emulation test against the ELF (`west zmk-build` writes to
 # <west topdir>/build/<artifact>/, and this repo is its own west workspace):
-#   west zmk-renode-test tests/renode \
+#   python3 tools/renode_core.py run --cache /tmp/pmw-renode-core -- \
+#     west zmk-renode-test tests/renode \
 #       --elf build/renode/zephyr/zmk.elf --skip-smoke
 #
 # CONFIG_PMW3610_LOG_LEVEL_DBG surfaces the driver's per-report "x/y: N/N"
