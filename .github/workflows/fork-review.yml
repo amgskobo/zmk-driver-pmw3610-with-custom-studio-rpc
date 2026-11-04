@@ -37,7 +37,9 @@ jobs:
       - uses: ./.github/actions/west-init
       - name: Prepare locked Web environment
         working-directory: web
-        run: npm ci
+        run: |
+          npm ci
+          npm run generate
       - name: Prepare checker environments
         run: /tmp/pmw3610-checkers/bin/python -m pre_commit install-hooks
       - name: Complete owner checks
