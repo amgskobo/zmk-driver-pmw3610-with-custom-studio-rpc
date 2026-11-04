@@ -49,6 +49,7 @@ struct pixart_data {
 
     struct gpio_callback irq_gpio_cb; // motion pin irq callback
     struct k_work trigger_work;       // realtrigger job
+    struct k_work activity_work;      // apply activity on the low-priority queue
 
     struct k_work_delayable init_work; // the work structure for delayable init steps
     int async_init_step;
@@ -63,7 +64,7 @@ struct pixart_data {
 
     /* Serializes composite register sequences (e.g. multi-write CPI, clock
      * on/off wrapped writes, burst report reads) against concurrent access
-     * from the Studio RPC thread while the trigger work runs on the system
+     * from the Studio RPC thread while the trigger work runs on the low-priority
      * workqueue. SPI bus arbitration alone is not enough since these
      * sequences are multiple SPI transactions that must not interleave. */
     struct k_mutex lock;

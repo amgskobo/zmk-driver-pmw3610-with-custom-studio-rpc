@@ -13,6 +13,7 @@
 #include <zephyr/pm/device.h>
 #include <zmk/keymap.h>
 #include <zmk/activity.h>
+#include <zmk/workqueue.h>
 #include <zmk/events/activity_state_changed.h>
 #include "pmw3610.h"
 #include <cormoran/pmw3610/pmw3610_api.h>
@@ -216,16 +217,14 @@ static int pmw3610_write_reg(const struct device *dev, uint8_t addr, uint8_t val
 }
 
 static int pmw3610_write(const struct device *dev, uint8_t reg, uint8_t val) {
-    pmw3610_write_reg(dev, PMW3610_REG_SPI_CLK_ON_REQ, PMW3610_SPI_CLOCK_CMD_ENABLE);
-    k_sleep(K_USEC(T_CLOCK_ON_DELAY_US));
-
-    int err = pmw3610_write_reg(dev, reg, val);
-    if (unlikely(err != 0)) {
-        return err;
+    int err = pmw3610_write_reg(dev, PMW3610_REG_SPI_CLK_ON_REQ, PMW3610_SPI_CLOCK_CMD_ENABLE);
+    if (!err) {
+        k_sleep(K_USEC(T_CLOCK_ON_DELAY_US));
+        err = pmw3610_write_reg(dev, reg, val);
     }
-
-    pmw3610_write_reg(dev, PMW3610_REG_SPI_CLK_ON_REQ, PMW3610_SPI_CLOCK_CMD_DISABLE);
-    return 0;
+    int cleanup_err =
+        pmw3610_write_reg(dev, PMW3610_REG_SPI_CLK_ON_REQ, PMW3610_SPI_CLOCK_CMD_DISABLE);
+    return err ? err : cleanup_err;
 }
 
 /* Caller must hold data->lock (composite multi-write sequence). */
@@ -250,19 +249,26 @@ static int pmw3610_set_cpi_locked(const struct device *dev, uint32_t cpi) {
     uint8_t addr[] = {0x7F, PMW3610_REG_RES_STEP, 0x7F};
     uint8_t data[] = {0xFF, value, 0x00};
 
-    pmw3610_write_reg(dev, PMW3610_REG_SPI_CLK_ON_REQ, PMW3610_SPI_CLOCK_CMD_ENABLE);
-    k_sleep(K_USEC(T_CLOCK_ON_DELAY_US));
+    int err = pmw3610_write_reg(dev, PMW3610_REG_SPI_CLK_ON_REQ, PMW3610_SPI_CLOCK_CMD_ENABLE);
+    if (!err) {
+        k_sleep(K_USEC(T_CLOCK_ON_DELAY_US));
+    }
 
     /* Write data */
-    int err;
-    for (size_t i = 0; i < sizeof(data); i++) {
+    for (size_t i = 0; !err && i < sizeof(data); i++) {
         err = pmw3610_write_reg(dev, addr[i], data[i]);
         if (err) {
             LOG_ERR("Burst write failed on SPI write (data)");
             break;
         }
     }
-    pmw3610_write_reg(dev, PMW3610_REG_SPI_CLK_ON_REQ, PMW3610_SPI_CLOCK_CMD_DISABLE);
+    /* A failed page-one write must not strand subsequent accesses there. */
+    int page_err = err ? pmw3610_write_reg(dev, PMW3610_REG_SPI_PAGE0, 0x00) : 0;
+    int clock_err =
+        pmw3610_write_reg(dev, PMW3610_REG_SPI_CLK_ON_REQ, PMW3610_SPI_CLOCK_CMD_DISABLE);
+    if (!err) {
+        err = page_err ? page_err : clock_err;
+    }
 
     if (err) {
         LOG_ERR("Failed to set CPI");
@@ -361,38 +367,30 @@ static int pmw3610_set_downshift_time(const struct device *dev, uint8_t reg_addr
 
 /* Set the performance (force-awake) register.
  *
- * `force_awake_runtime` reflects the current runtime force-awake flag (from
- * pixart_data.runtime.force_awake, which may differ from the DT
- * force-awake property once changed via settings/RPC). When disabled, the
- * performance register is left untouched (matches previous behavior where
- * config->force_awake gated the whole function). */
+ * Disabling force-awake must clear previously applied force bits too.
+ * Caller owns data->lock throughout the read/modify/write sequence. */
 static int pmw3610_set_performance(const struct device *dev, bool force_awake_runtime,
                                    bool enabled) {
-    int err = 0;
+    uint8_t value;
+    int err = pmw3610_read_reg(dev, PMW3610_REG_PERFORMANCE, &value);
+    if (err) {
+        LOG_ERR("Can't read ref-performance %d", err);
+        return err;
+    }
+    LOG_INF("Get performance register (reg value 0x%x)", value);
 
-    if (force_awake_runtime) {
-        uint8_t value;
-        err = pmw3610_read_reg(dev, PMW3610_REG_PERFORMANCE, &value);
+    uint8_t perf = value & 0x0F; /* Preserve the low bits; clear force bits. */
+    if (force_awake_runtime && enabled) {
+        perf |= 0xF0;
+    }
+    if (perf != value) {
+        err = pmw3610_write(dev, PMW3610_REG_PERFORMANCE, perf);
         if (err) {
-            LOG_ERR("Can't read ref-performance %d", err);
+            LOG_ERR("Can't write performance register %d", err);
             return err;
         }
-        LOG_INF("Get performance register (reg value 0x%x)", value);
-
-        uint8_t perf = value & 0x0F; // reset bit[3..0] to 0x0 (normal operation)
-        if (enabled) {
-            perf |= 0xF0; // set bit[3..0] to 0xF (force awake)
-        }
-        if (perf != value) {
-            err = pmw3610_write(dev, PMW3610_REG_PERFORMANCE, perf);
-            if (err) {
-                LOG_ERR("Can't write performance register %d", err);
-                return err;
-            }
-            LOG_INF("Set performance register (reg value 0x%x)", perf);
-        }
+        LOG_INF("Set performance register (reg value 0x%x)", perf);
     }
-
     return err;
 }
 
@@ -407,7 +405,11 @@ static int pmw3610_set_interrupt(const struct device *dev, const bool en) {
 }
 
 static int pmw3610_async_init_power_up(const struct device *dev) {
-    int ret = pmw3610_write_reg(dev, PMW3610_REG_POWER_UP_RESET, PMW3610_POWERUP_CMD_RESET);
+    /* Recovery may start after an interrupted page-one operation. */
+    int ret = pmw3610_write_reg(dev, PMW3610_REG_SPI_PAGE0, 0x00);
+    if (!ret) {
+        ret = pmw3610_write_reg(dev, PMW3610_REG_POWER_UP_RESET, PMW3610_POWERUP_CMD_RESET);
+    }
     if (ret < 0) {
         return ret;
     }
@@ -450,17 +452,10 @@ static int pmw3610_async_init_configure(const struct device *dev) {
     int err = 0;
     struct pixart_data *data = dev->data;
 
-    // clear motion registers first (required in datasheet)
-    for (uint8_t reg = 0x02; (reg <= 0x05) && !err; reg++) {
-        uint8_t buf[1];
-        err = pmw3610_read_reg(dev, reg, buf);
-    }
-
     // Overlay persisted/effective custom-setting values onto the runtime
-    // config before it is applied to hardware below. This runs strictly
-    // after main()'s settings_load() has returned (see
-    // pmw3610_settings_apply.h for why there is no boot-ordering race),
-    // and before `data->ready` is set, so the immediate-push branches in
+    // config before it is applied to hardware below. The initialized event
+    // is the backstop if settings_load() has not finished yet (see
+    // pmw3610_settings_apply.h). Before `data->ready` is set, the immediate-push branches in
     // the pmw3610_set_* setters are no-ops here -- only the in-memory
     // struct is updated, then applied once below.
     if (IS_ENABLED(CONFIG_ZMK_PMW3610_CUSTOM_SETTINGS)) {
@@ -469,16 +464,19 @@ static int pmw3610_async_init_configure(const struct device *dev) {
 
     k_mutex_lock(&data->lock, K_FOREVER);
     struct pixart_runtime_config rt = data->runtime;
-    k_mutex_unlock(&data->lock);
+
+    // Clear and configure as one sensor transaction sequence.
+    for (uint8_t reg = 0x02; (reg <= 0x05) && !err; reg++) {
+        uint8_t buf[1];
+        err = pmw3610_read_reg(dev, reg, buf);
+    }
 
     if (!err) {
         err = pmw3610_set_performance(dev, rt.force_awake, true);
     }
 
     if (!err) {
-        k_mutex_lock(&data->lock, K_FOREVER);
         err = pmw3610_set_cpi_locked(dev, rt.cpi);
-        k_mutex_unlock(&data->lock);
     }
 
     if (!err) {
@@ -507,6 +505,7 @@ static int pmw3610_async_init_configure(const struct device *dev) {
         err = pmw3610_set_sample_time(dev, PMW3610_REG_REST3_RATE, rt.rest3_sample_ms);
     }
 
+    k_mutex_unlock(&data->lock);
     if (err) {
         LOG_ERR("Config the sensor failed");
         return err;
@@ -527,7 +526,15 @@ static void pmw3610_async_init(struct k_work *work) {
         return;
     }
 
+    /* Configure overlays Custom Settings before taking the sensor lock;
+     * the other steps contain only SPI operations and are locked here. */
+    if (current_step != ASYNC_INIT_STEP_CONFIGURE) {
+        k_mutex_lock(&data->lock, K_FOREVER);
+    }
     data->err = async_init_fn[current_step](dev);
+    if (current_step != ASYNC_INIT_STEP_CONFIGURE) {
+        k_mutex_unlock(&data->lock);
+    }
     if (data->err) {
         if (data->async_init_retry_count < 10) {
             data->async_init_retry_count++;
@@ -573,7 +580,6 @@ static int pmw3610_report_data(const struct device *dev) {
         return 0;
     }
     struct pixart_runtime_config rt = data->runtime;
-    k_mutex_unlock(&data->lock);
 
     uint32_t report_interval_min_ms = rt.report_interval_min_ms;
     int64_t now = k_uptime_get();
@@ -582,12 +588,14 @@ static int pmw3610_report_data(const struct device *dev) {
         // Burst mode requires cs pin to reset
         int err = pmw3610_read(dev, PMW3610_REG_MOTION_BURST, buf, sizeof(buf));
         if (err) {
+            k_mutex_unlock(&data->lock);
             return err;
         }
     } else {
         for (size_t i = 0; i < PMW3610_BURST_SIZE; i++) {
             int err = pmw3610_read(dev, PMW3610_REG_MOTION + i, &buf[i], 1);
             if (err) {
+                k_mutex_unlock(&data->lock);
                 return err;
             }
         }
@@ -643,6 +651,7 @@ static int pmw3610_report_data(const struct device *dev) {
     if (report_interval_min_ms > 0) {
         // strict to report inerval
         if (now - data->last_rpt_time < report_interval_min_ms) {
+            k_mutex_unlock(&data->lock);
             return 0;
         }
     }
@@ -659,6 +668,10 @@ static int pmw3610_report_data(const struct device *dev) {
         }
         data->dx = 0;
         data->dy = 0;
+    }
+    k_mutex_unlock(&data->lock);
+
+    if (have_x || have_y) {
         if (have_x) {
             input_report(dev, config->evt_type, config->x_input_code, rx, !have_y, K_NO_WAIT);
         }
@@ -675,14 +688,30 @@ static void pmw3610_gpio_callback(const struct device *gpiob, struct gpio_callba
     struct pixart_data *data = CONTAINER_OF(cb, struct pixart_data, irq_gpio_cb);
     const struct device *dev = data->dev;
     pmw3610_set_interrupt(dev, false);
-    k_work_submit(&data->trigger_work);
+    /* A queued motion sample must not wait on a multi-second capture from
+     * the system workqueue, which also owns keyboard input and Studio lock. */
+    k_work_submit_to_queue(zmk_workqueue_lowprio_work_q(), &data->trigger_work);
 }
 
 static void pmw3610_work_callback(struct k_work *work) {
     struct pixart_data *data = CONTAINER_OF(work, struct pixart_data, trigger_work);
     const struct device *dev = data->dev;
     pmw3610_report_data(dev);
-    pmw3610_set_interrupt(dev, true);
+    k_mutex_lock(&data->lock, K_FOREVER);
+    if (data->ready && !data->capture_active) {
+        pmw3610_set_interrupt(dev, true);
+    }
+    k_mutex_unlock(&data->lock);
+}
+
+static void pmw3610_activity_work_callback(struct k_work *work) {
+    struct pixart_data *data = CONTAINER_OF(work, struct pixart_data, activity_work);
+    k_mutex_lock(&data->lock, K_FOREVER);
+    if (data->ready && !data->capture_active) {
+        pmw3610_set_performance(data->dev, data->runtime.force_awake,
+                                zmk_activity_get_state() == ZMK_ACTIVITY_ACTIVE);
+    }
+    k_mutex_unlock(&data->lock);
 }
 
 static int pmw3610_enable_irq(const struct device *dev) {
@@ -785,6 +814,7 @@ static int pmw3610_init(const struct device *dev) {
 
     // init trigger handler work
     k_work_init(&data->trigger_work, pmw3610_work_callback);
+    k_work_init(&data->activity_work, pmw3610_activity_work_callback);
 
     // Setup delayable and non-blocking init jobs, including following steps:
     // 1. power reset
@@ -941,13 +971,10 @@ static int on_activity_state(const zmk_event_t *eh) {
     for (size_t i = 0; i < ARRAY_SIZE(pmw3610_devs); i++) {
         const struct device *dev = pmw3610_devs[i];
         struct pixart_data *data = dev->data;
-        if (!data->ready) {
-            continue;
+        if (!data->dev) {
+            continue; /* Device initialization failed before work was set up. */
         }
-        k_mutex_lock(&data->lock, K_FOREVER);
-        bool force_awake = data->runtime.force_awake;
-        k_mutex_unlock(&data->lock);
-        pmw3610_set_performance(dev, force_awake, enable);
+        k_work_submit_to_queue(zmk_workqueue_lowprio_work_q(), &data->activity_work);
     }
 
     return 0;
@@ -994,10 +1021,14 @@ int pmw3610_get_init_error(const struct device *dev) {
 }
 
 int pmw3610_read_register(const struct device *dev, uint8_t addr, uint8_t *value) {
-    if (!dev) {
+    if (!dev || !value) {
         return -ENODEV;
     }
-    return pmw3610_read_reg(dev, addr, value);
+    struct pixart_data *data = dev->data;
+    k_mutex_lock(&data->lock, K_FOREVER);
+    int err = pmw3610_read_reg(dev, addr, value);
+    k_mutex_unlock(&data->lock);
+    return err;
 }
 
 int pmw3610_write_register(const struct device *dev, uint8_t addr, uint8_t value) {
@@ -1232,8 +1263,10 @@ int pmw3610_set_force_awake(const struct device *dev, bool enabled) {
     bool active = zmk_activity_get_state() == ZMK_ACTIVITY_ACTIVE;
 
     k_mutex_lock(&data->lock, K_FOREVER);
-    data->runtime.force_awake = enabled;
     int err = data->ready ? pmw3610_set_performance(dev, enabled, active) : 0;
+    if (!err) {
+        data->runtime.force_awake = enabled;
+    }
     k_mutex_unlock(&data->lock);
     return err;
 }
@@ -1392,15 +1425,14 @@ int pmw3610_frame_capture_begin(const struct device *dev,
     struct pixart_data *data = dev->data;
 
     k_mutex_lock(&data->lock, K_FOREVER);
-    if (!data->ready) {
+    if (!data->ready || data->capture_active) {
         k_mutex_unlock(&data->lock);
         return -EBUSY;
     }
     data->capture_active = true;
-    k_mutex_unlock(&data->lock);
 
-    /* Disable the motion IRQ outside the lock (matches pmw3610_set_interrupt
-     * usage elsewhere in this file, which does not require data->lock). */
+    /* Keep force-run's composite SPI sequence serialized with motion,
+     * settings, activity and raw-register access. */
     pmw3610_set_interrupt(dev, false);
 
     int64_t deadline = k_uptime_get() + PMW3610_FRAME_CAPTURE_TIMEOUT_MS;
@@ -1410,7 +1442,6 @@ int pmw3610_frame_capture_begin(const struct device *dev,
          * with the IRQ disabled and no session to end() -- same cleanup
          * pmw3610_frame_capture_end() does. */
         LOG_WRN("Frame capture: begin() failed (errno %d), reverting", err);
-        k_mutex_lock(&data->lock, K_FOREVER);
         pmw3610_capture_frame_recover_locked(dev);
         data->capture_active = false;
         data->capture_mode_active = false;
@@ -1418,7 +1449,6 @@ int pmw3610_frame_capture_begin(const struct device *dev,
         return err;
     }
 
-    k_mutex_lock(&data->lock, K_FOREVER);
     data->capture_mode_active = true;
     k_mutex_unlock(&data->lock);
     return 0;
@@ -1561,6 +1591,13 @@ static int pmw3610_frame_capture_read_pixel_grab_locked(const struct device *dev
     }
 
 pixel_grab_done:
+    if (err) {
+        /* Best-effort cleanup preserves the original failure. Re-init also
+         * restores page zero before resetting, so repeated SPI errors remain
+         * recoverable after the bus starts working again. */
+        pmw3610_write_reg(dev, PMW3610_REG_SPI_PAGE0, 0x00);
+        pmw3610_write_reg(dev, PMW3610_REG_SPI_CLK_ON_REQ, PMW3610_SPI_CLOCK_CMD_DISABLE);
+    }
     *collected_out = collected;
     return err;
 }

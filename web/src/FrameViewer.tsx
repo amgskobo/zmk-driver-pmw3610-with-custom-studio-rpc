@@ -26,6 +26,7 @@ export const PMW3610_SUBSYSTEM_IDENTIFIER = "cormoran__pmw3610";
 const SIDE_OPTIONS = [19, 20, 21, 22];
 const DEFAULT_SIDE = 22;
 const PIXEL_SCALE = 12; // px per sensor pixel on <canvas>
+const STREAM_RENEWAL_MS = 2000;
 
 interface AdvancedOptions {
   maxInvalidRetries: string;
@@ -40,6 +41,9 @@ interface FrameSession {
   source: number;
   correlator: PeripheralResponseCorrelator;
   stop?: () => Promise<boolean>;
+  renew?: () => Promise<boolean>;
+  streamEpoch?: number;
+  leaseMs?: number;
 }
 
 const DEFAULT_ADVANCED: AdvancedOptions = {
@@ -109,6 +113,7 @@ export function FrameViewer({ locked = false }: FrameViewerProps = {}) {
     setIsCapturing(false);
     return () => {
       session.retired = true;
+      session.renew = undefined;
       // Retire a pending start as well as an active stream. A pending stop
       // already targets this connection; do not issue it twice.
       if (session.operation !== "stop") {
@@ -333,14 +338,18 @@ export function FrameViewer({ locked = false }: FrameViewerProps = {}) {
 
   const setFrameStream = async (
     enable: boolean,
-    session: FrameSession
+    session: FrameSession,
+    renewOnly = false
   ): Promise<boolean> => {
+    const generation = session.generation;
     const resp = await callRequest(
       Request.create({
         setFrameStream: {
           deviceIndex,
           source,
           enable,
+          renewOnly,
+          streamEpoch: renewOnly ? (session.streamEpoch ?? 0) : 0,
           pixelCount: enable ? side * side : 0,
           maxInvalidRetries: advanced.maxInvalidRetries
             ? Number.parseInt(advanced.maxInvalidRetries, 10)
@@ -355,6 +364,22 @@ export function FrameViewer({ locked = false }: FrameViewerProps = {}) {
     if (!resp.setFrameStream) {
       throw new Error("SetFrameStream response missing set_frame_stream field");
     }
+    if (
+      renewOnly &&
+      resp.setFrameStream.streaming &&
+      resp.setFrameStream.streamEpoch !== session.streamEpoch
+    ) {
+      throw new Error("Frame stream renewal belongs to a different session");
+    }
+    if (
+      enable &&
+      !renewOnly &&
+      !session.retired &&
+      session.generation === generation
+    ) {
+      session.streamEpoch = resp.setFrameStream.streamEpoch;
+      session.leaseMs = resp.setFrameStream.leaseMs;
+    }
     return resp.setFrameStream.streaming;
   };
 
@@ -362,7 +387,8 @@ export function FrameViewer({ locked = false }: FrameViewerProps = {}) {
     const session = sessionRef.current;
     if (!session?.active || session.operation || !session.stop) return;
     session.operation = "stop";
-    const generation = session.generation;
+    session.renew = undefined;
+    const generation = ++session.generation;
     setStreamState({ streaming: true, changing: true });
     setError(null);
     try {
@@ -371,6 +397,7 @@ export function FrameViewer({ locked = false }: FrameViewerProps = {}) {
       }
       session.active = false;
       session.stop = undefined;
+      session.renew = undefined;
     } catch (e) {
       if (!session.retired && session.generation === generation) {
         setError(e instanceof Error ? e.message : "Unknown error");
@@ -391,7 +418,8 @@ export function FrameViewer({ locked = false }: FrameViewerProps = {}) {
     session.side = side;
     session.source = source;
     session.stop = () => setFrameStream(false, session);
-    const generation = session.generation;
+    session.renew = undefined;
+    const generation = ++session.generation;
     setStreamState({ streaming: false, changing: true });
     setError(null);
     assemblersRef.current.clear();
@@ -407,7 +435,14 @@ export function FrameViewer({ locked = false }: FrameViewerProps = {}) {
         return;
       }
       session.active = streaming;
-      if (!streaming) session.stop = undefined;
+      if (streaming) {
+        if (session.streamEpoch && session.leaseMs) {
+          // Capture the exact options and epoch; renewal never starts a stream.
+          session.renew = () => setFrameStream(true, session, true);
+        }
+      } else {
+        session.stop = undefined;
+      }
     } catch (e) {
       if (session.retired || session.generation !== generation) return;
       if (isUnlockRequiredError(e)) {
@@ -415,6 +450,10 @@ export function FrameViewer({ locked = false }: FrameViewerProps = {}) {
           "ZMK Studio is locked -- press the Studio unlock key on your keyboard."
         );
       } else {
+        // A relay timeout can follow a successful peripheral start. Keep a
+        // Stop control for this uncertain ownership, but do not renew it:
+        // firmware will expire the lease even if that Stop also gets lost.
+        session.active = true;
         setError(e instanceof Error ? e.message : "Unknown error");
       }
     } finally {
@@ -424,6 +463,67 @@ export function FrameViewer({ locked = false }: FrameViewerProps = {}) {
       }
     }
   };
+
+  useEffect(() => {
+    const session = sessionRef.current;
+    if (!isStreaming || !session?.renew || locked) return;
+    let retired = false;
+    let pending = false;
+    const timer = window.setInterval(() => {
+      if (
+        retired ||
+        pending ||
+        session.retired ||
+        !session.active ||
+        session.operation ||
+        !session.renew
+      )
+        return;
+      const generation = session.generation;
+      pending = true;
+      void session
+        .renew()
+        .then((streaming) => {
+          if (
+            retired ||
+            session.retired ||
+            !session.active ||
+            session.operation ||
+            session.generation !== generation
+          )
+            return;
+          if (!streaming) {
+            session.active = false;
+            session.renew = undefined;
+            session.stop = undefined;
+            setStreamState({ streaming: false, changing: false });
+          }
+        })
+        .catch((error: unknown) => {
+          if (
+            retired ||
+            session.retired ||
+            !session.active ||
+            session.operation ||
+            session.generation !== generation
+          )
+            return;
+          session.renew = undefined;
+          setError(
+            error instanceof Error
+              ? error.message
+              : "Frame stream renewal failed"
+          );
+        })
+        .finally(() => {
+          pending = false;
+        });
+    }, STREAM_RENEWAL_MS);
+    return () => {
+      retired = true;
+      window.clearInterval(timer);
+    };
+  }, [isStreaming, locked, connection, subsystem?.index]);
 
   // A single always-on subscription (not tied to the streaming lifecycle)
   // handles both this component's own relayed requests (CaptureFrame/
@@ -474,6 +574,7 @@ export function FrameViewer({ locked = false }: FrameViewerProps = {}) {
     if (locked && session) {
       session.generation++;
       session.active = false;
+      session.renew = undefined;
       // Reacting to an external system (the firmware silently stopping the
       // stream on lock) becoming out of sync with local UI state, not a
       // derived-state anti-pattern -- see the comment above.

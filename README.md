@@ -181,7 +181,7 @@ For more info on modules, you can read through through the [Zephyr modules page]
 
 With `CONFIG_ZMK_PMW3610_CUSTOM_SETTINGS=y`, the following keys are
 registered **once per PMW3610 devicetree instance**, as `"<param>@<id>"`
-(all public/unsecured, readable and writable over the generic
+(public reads; writes, save, discard and reset require Studio unlock over the generic
 custom-settings Studio RPC subsystem provided by
 [zmk-feature-custom-settings](https://github.com/cormoran/zmk-feature-custom-settings)):
 
@@ -326,8 +326,8 @@ on its own:
   (forcing run mode and confirming it landed -- this one-time setup can take
   up to ~700ms from a deep rest mode; a failure here is returned as an
   `ErrorResponse` and streaming stays off) and starts a background loop (a
-  dedicated low-priority workqueue, so it never blocks unrelated system
-  workqueue consumers) that captures one frame per iteration **with no reset
+  shared low-priority workqueue; motion and activity register work also use
+  this queue, keeping capture-mutex waits off the system workqueue) that captures one frame per iteration **with no reset
   in between** and, on each successful capture, raises one `FrameStreamChunk`
   **notification** (not a response) per 128-byte chunk —
   `{frame_id, offset, bytes data, total_size, complete, format}`, where
@@ -339,10 +339,33 @@ on its own:
   clamped semantics as `CaptureFrame` (on the burst path `max_invalid_retries`
   is the post-arm-wait / fps knob; on the 3-wire fallback it is the per-pixel
   retry budget).
-  While a session is active, repeating the same options is idempotent;
+  While a session is active, repeating the same options is idempotent and
+  renews its client lease. Automatic renewal uses `renew_only=true` and the
+  nonzero `stream_epoch` returned by the original start;
   changing the device or capture options requires stopping first. A new
   start can return a busy error while the previous capture is finishing;
   retry after cleanup has restored navigation.
+- A stream requires a live client renewal. The default lease is **15 seconds**
+  (`CONFIG_ZMK_PMW3610_FRAME_STREAM_LEASE_MS`, range 10–120 seconds); the Web
+  viewer repeats the capture options with `renew_only=true` and that stream's
+  epoch every **2 seconds**. Closing the
+  Serial connection, tab or process stops renewal. A kernel timer then retires
+  stream authorization independently of the capture worker and queues sensor
+  cleanup. A renewal received after expiry or completed cleanup cannot revive
+  the retired session, and an old epoch cannot renew a replacement session.
+  Missing/zero epochs are rejected for renew-only requests. An explicit start
+  retains the older request format and receives a new nonzero epoch.
+  **Older viewers must implement renewal too:** their streams expire after one
+  lease. Local and relayed streams use the same policy on the sensor-owning half.
+  A newer viewer connected to older firmware can still use its existing start
+  and stop controls, but that firmware does not provide this lease guarantee.
+  A lost start response leaves the Web Stop control available and receives no
+  renewal, so a successfully started but unacknowledged stream also expires.
+- Lease expiry stops further authorized chunks, but physical navigation resumes
+  only after the current capture or synchronous Studio send returns and cleanup
+  runs. The selected ZMK core can wait indefinitely for TX space while holding
+  its transport mutex. This module cannot cancel that core call; lease expiry
+  does not establish a bounded recovery time during that separate core stall.
 - `SetFrameStream` and `CaptureFrame`/`GetFrameChunk` share the same
   firmware-side static buffer/`frame_id` counter, so only one can be active
   — a mutex excludes overlapping sensor captures and frame-buffer access.

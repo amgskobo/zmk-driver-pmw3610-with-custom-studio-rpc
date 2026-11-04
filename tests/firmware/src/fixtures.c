@@ -2,6 +2,7 @@
 #include <stdio.h>
 #include <pb_decode.h>
 #include <pb_encode.h>
+#include <zephyr/sys/atomic.h>
 #include <cormoran/pmw3610/pmw3610_api.h>
 #include <zmk/studio/custom.h>
 #include <zmk/split/central.h>
@@ -10,9 +11,10 @@ static struct k_work_q queue;
 K_THREAD_STACK_DEFINE(queue_stack, 8192);
 K_SEM_DEFINE(gate_entered, 0, 1);
 K_SEM_DEFINE(gate_release, 0, 1);
+static atomic_t gate_owned;
 bool test_sensor_capturing[2];
 unsigned test_begin_calls[2], test_end_calls[2];
-bool test_cancel_begin, test_cancel_read;
+bool test_cancel_begin, test_cancel_read, test_fail_read;
 void (*test_begin_hook)(void);
 unsigned test_notification_count, test_response_count, test_request_count, test_stop_count;
 cormoran_pmw3610_Notification test_notifications[64];
@@ -36,15 +38,30 @@ static void gate_handler(struct k_work *work) {
 }
 K_WORK_DEFINE(gate, gate_handler);
 void test_block_queue(void) {
+    zassert_equal(k_work_busy_get(&gate), 0);
+    zassert_true(atomic_cas(&gate_owned, 0, 1));
+    k_sem_reset(&gate_entered);
+    k_sem_reset(&gate_release);
     k_work_submit_to_queue(&queue, &gate);
     zassert_ok(k_sem_take(&gate_entered, K_SECONDS(2)));
 }
-void test_release_queue(void) { k_sem_give(&gate_release); }
-void test_drain_queue(void) { k_work_queue_drain(&queue, false); }
+void test_release_queue(void) {
+    /* A failed case and its cleanup may both release the same gate. */
+    if (atomic_cas(&gate_owned, 1, 0)) {
+        k_sem_give(&gate_release);
+    }
+}
+void test_drain_queue(void) {
+    k_work_queue_drain(&queue, false);
+    /* The gate handler has returned, so neither reset can steal its permit. */
+    k_sem_reset(&gate_entered);
+    k_sem_reset(&gate_release);
+}
 void test_clear_sinks(void) {
     test_notification_count = test_response_count = test_request_count = test_stop_count = 0;
     test_stop_error = 0;
     test_cancel_begin = test_cancel_read = false;
+    test_fail_read = false;
     test_begin_hook = NULL;
     memset(test_begin_calls, 0, sizeof(test_begin_calls));
     memset(test_end_calls, 0, sizeof(test_end_calls));
@@ -118,6 +135,11 @@ int pmw3610_frame_capture_read(const struct device *device,
     zassert_true(test_sensor_capturing[device - devices]);
     result->pixel_count = MIN(params->pixel_count ? params->pixel_count : 484, length);
     memset(buffer, 0x81, result->pixel_count);
+    if (test_fail_read) {
+        buffer[0] = 0x9a;
+        pmw3610_request_stop_stream();
+        return -EIO;
+    }
     result->complete = true;
     if (test_cancel_read)
         pmw3610_request_stop_stream();
@@ -134,6 +156,7 @@ int pmw3610_capture_frame(const struct device *device,
                           const struct pmw3610_frame_capture_params *params, uint8_t *buffer,
                           uint16_t length, struct pmw3610_frame_capture_result *result) {
     pmw3610_frame_capture_begin(device, params);
-    pmw3610_frame_capture_read(device, params, buffer, length, result);
-    return pmw3610_frame_capture_end(device);
+    int err = pmw3610_frame_capture_read(device, params, buffer, length, result);
+    int end_err = pmw3610_frame_capture_end(device);
+    return err ? err : end_err;
 }

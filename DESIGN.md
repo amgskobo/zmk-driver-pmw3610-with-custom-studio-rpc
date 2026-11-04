@@ -53,8 +53,34 @@ proto generation only under `CONFIG_ZMK_PMW3610_STUDIO_RPC`; settings glue
   register sequences (multi-write CPI, the clock-on/off wrapped `pmw3610_write`
   helper used by downshift/sample/performance/smart-algorithm writes, and
   reads of the runtime struct) against concurrent access from the Studio RPC
-  thread while the trigger work runs on the system workqueue. SPI bus
+  thread while the trigger work runs on the low-priority workqueue. SPI bus
   arbitration alone does not serialize *sequences* of transactions.
+
+Motion and activity register work run on ZMK's shared low-priority workqueue.
+Their sensor-mutex waits cannot occupy the system workqueue during a long
+capture. Motion, smart-algorithm writes, capture begin/read, raw registers and
+configuration sequences retain the same sensor lock through their SPI work.
+Activity work skips an active capture session; recovery reapplies the current
+runtime settings. Clock-wrapped writes report clock errors and attempt clock
+disable after payload failure. Failed CPI and Pixel_Grab page-one sequences
+attempt page-zero cleanup; initialization explicitly selects page zero before
+power-up reset so later retries can recover after transient SPI errors.
+
+Frame streaming has a sensor-owned client lease. Automatic renewals use
+SetFrameStream with identical capture options, `renew_only=true`, and the
+nonzero epoch returned by the original start. A renew-only request never
+starts a session, including after completed cleanup; stale/missing epochs are
+rejected. Explicit legacy starts remain accepted and receive a new epoch.
+The Web viewer renews every two seconds; firmware
+defaults to a fifteen-second lease. An independent kernel timer atomically
+retires the stream generation and schedules cleanup after expiry. Renewals use
+a copied lease identity under a separate spinlock, so capture and notification
+encoding cannot make renewal wait for the frame-buffer mutex. A lost start
+reply leaves a Stop action available without renewing uncertain ownership.
+Expiry is an authorization boundary, not a deadline for interrupting a core
+Studio TX call already blocked on buffer space. Sensor cleanup requires that
+call and any in-flight capture to return.
+
 - Public API (`include/cormoran/pmw3610/pmw3610_api.h`):
   - `pmw3610_device_count()` / `pmw3610_get_device(index)` (existing).
   - `pmw3610_is_ready(dev)`, `pmw3610_get_init_error(dev)` (existing).
@@ -239,10 +265,11 @@ procedure (R2.4, PIXEL_GRAB register usage section):
 Driver-side wrapper behavior (`pmw3610_capture_frame()` in
 `src/pmw3610.c`), unchanged from Phase C where still applicable:
 
-- Require `data->ready` (else `-EBUSY`); take `data->lock`, set
+- Take `data->lock`, require `data->ready` and no existing capture (else `-EBUSY`), set
   `data->capture_active = true` (checked and short-circuited by
   `pmw3610_report_data()`, belt-and-braces alongside disabling the IRQ),
-  release the lock, then `pmw3610_set_interrupt(dev, false)`.
+  disable the IRQ and force run mode while keeping that lock. Release it
+  between begin/read/end calls; each composite sensor sequence owns the lock.
 - The arm sequence (steps 1-7) uses **raw** `pmw3610_write_reg()` calls,
   NOT the `pmw3610_write()` clk-on/off wrapper -- the datasheet sequence
   manages the 0x41 SPI clock request itself (steps 1 and 5).
@@ -313,7 +340,7 @@ Notification = oneof { FrameStreamChunk } // top-level message, Phase E
 - `SetFrameStream{device_index, enable, pixel_count, max_invalid_retries}` →
   `{streaming}`. Implemented in Phase E, replacing the original plan of
   "streaming" being a client-side `CaptureFrame`+`GetFrameChunk` poll loop.
-  `enable=true` starts a `k_work_delayable` loop on the system workqueue
+  `enable=true` starts a `k_work_delayable` loop on the low-priority workqueue
   that repeatedly calls `pmw3610_capture_frame()` and raises one
   `FrameStreamChunk` Notification per 128-byte chunk of every captured
   frame; `enable=false` stops it (current in-flight capture, if any, still
@@ -506,7 +533,7 @@ index (`STRUCT_SECTION_GET`/`STRUCT_SECTION_COUNT` over
 `custom_subsystem_index_for_identifier()` does in
 `custom_settings_handler.c` — copy that pattern).
 
-Firmware: a `k_work_delayable` loop (system workqueue) that, while streaming
+Firmware: a `k_work_delayable` loop (low-priority workqueue) that, while streaming
 is enabled, repeatedly calls the existing `pmw3610_capture_frame()` and, on
 success, raises one `FrameStreamChunk` notification per 128-byte chunk
 (`raise_zmk_studio_custom_notification`, synchronous per ZMK's event

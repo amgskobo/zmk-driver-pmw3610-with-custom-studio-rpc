@@ -47,12 +47,13 @@ jobs:
         env:
           VITE_BASE: /${{ github.event.repository.name }}/
       - name: Upload build artifact
+        if: ${{ github.ref != 'refs/heads/codex/pmw3610-driver-review' }}
         uses: actions/upload-artifact@v4
         with:
           name: web-dist
           path: web/dist
       - name: Upload static files as artifact
-        if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+        if: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main') && github.ref != 'refs/heads/codex/pmw3610-driver-review' }}
         id: deployment
         uses: actions/upload-pages-artifact@v3
         with:

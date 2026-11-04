@@ -366,6 +366,12 @@ static uint32_t frame_stream_session_generation;
 static uint32_t frame_stream_device_index;
 static uint16_t frame_stream_pixel_count;
 static uint16_t frame_stream_max_invalid_retries;
+static struct k_spinlock frame_stream_lease_lock;
+static int64_t frame_stream_lease_deadline;
+static uint32_t frame_stream_lease_generation;
+static uint32_t frame_stream_lease_device_index;
+static uint16_t frame_stream_lease_pixel_count;
+static uint16_t frame_stream_lease_retries;
 
 /* Bounded retry budget for a transient (-ENOMEM) notification enqueue
  * failure -- see the back-pressure comment in frame_stream_work_handler().
@@ -378,15 +384,92 @@ static uint16_t frame_stream_max_invalid_retries;
 static void frame_stream_work_handler(struct k_work *work);
 static K_WORK_DELAYABLE_DEFINE(frame_stream_work, frame_stream_work_handler);
 
+/* Caller owns frame_stream_lease_lock. Zero is reserved for missing tokens. */
+static uint32_t frame_stream_advance_generation_locked(void) {
+    uint32_t generation = (uint32_t)atomic_get(&frame_stream_generation) + 1U;
+    if (generation == 0)
+        generation = 1;
+    atomic_set(&frame_stream_generation, generation);
+    return generation;
+}
+
+/* Timer expiry must remain independent of sensor and notification work. It
+ * retires authorization in interrupt context; physical cleanup stays on the
+ * low-priority queue and cannot interrupt the core's synchronous TX call. */
+static void frame_stream_lease_expired(struct k_timer *timer) {
+    ARG_UNUSED(timer);
+    k_spinlock_key_t key = k_spin_lock(&frame_stream_lease_lock);
+    bool expired =
+        frame_stream_lease_deadline != 0 && k_uptime_get() >= frame_stream_lease_deadline;
+    if (expired) {
+        frame_stream_lease_deadline = 0;
+        frame_stream_advance_generation_locked();
+        atomic_clear(&frame_stream_active);
+    }
+    k_spin_unlock(&frame_stream_lease_lock, key);
+    if (expired) {
+        k_work_reschedule_for_queue(zmk_workqueue_lowprio_work_q(), &frame_stream_work, K_NO_WAIT);
+    }
+}
+
+static K_TIMER_DEFINE(frame_stream_lease_timer, frame_stream_lease_expired, NULL);
+
+static void frame_stream_renew_lease(void) {
+    k_spinlock_key_t key = k_spin_lock(&frame_stream_lease_lock);
+    frame_stream_lease_generation = frame_stream_session_generation;
+    frame_stream_lease_device_index = frame_stream_device_index;
+    frame_stream_lease_pixel_count = frame_stream_pixel_count;
+    frame_stream_lease_retries = frame_stream_max_invalid_retries;
+    frame_stream_lease_deadline = k_uptime_get() + CONFIG_ZMK_PMW3610_FRAME_STREAM_LEASE_MS;
+    k_timer_start(&frame_stream_lease_timer, K_MSEC(CONFIG_ZMK_PMW3610_FRAME_STREAM_LEASE_MS),
+                  K_NO_WAIT);
+    k_spin_unlock(&frame_stream_lease_lock, key);
+}
+
+/* An identical renewal cannot wait for frame_lock: that mutex is held by
+ * capture and synchronous notification encoding. A copied lease identity,
+ * published under its own spinlock, lets the RPC renew without SPI access. */
+static bool frame_stream_try_renew(const cormoran_pmw3610_SetFrameStreamRequest *req) {
+    k_spinlock_key_t key = k_spin_lock(&frame_stream_lease_lock);
+    bool current =
+        atomic_get(&frame_stream_active) &&
+        frame_stream_lease_generation == (uint32_t)atomic_get(&frame_stream_generation) &&
+        frame_stream_lease_deadline > k_uptime_get() &&
+        frame_stream_lease_device_index == req->device_index &&
+        frame_stream_lease_pixel_count ==
+            MIN(req->pixel_count, (uint32_t)CONFIG_ZMK_PMW3610_STUDIO_RPC_FRAME_BUF_SIZE) &&
+        frame_stream_lease_retries == MIN(req->max_invalid_retries, (uint32_t)UINT16_MAX) &&
+        (!req->renew_only ||
+         (req->stream_epoch != 0 && req->stream_epoch == frame_stream_lease_generation));
+#if !PMW3610_IS_SPLIT_PERIPHERAL
+    current = current && zmk_studio_core_get_lock_state() == ZMK_STUDIO_CORE_LOCK_STATE_UNLOCKED;
+#endif
+    if (current) {
+        frame_stream_lease_deadline = k_uptime_get() + CONFIG_ZMK_PMW3610_FRAME_STREAM_LEASE_MS;
+        k_timer_start(&frame_stream_lease_timer, K_MSEC(CONFIG_ZMK_PMW3610_FRAME_STREAM_LEASE_MS),
+                      K_NO_WAIT);
+    }
+    k_spin_unlock(&frame_stream_lease_lock, key);
+    return current;
+}
+
 void pmw3610_request_stop_stream(void) {
-    atomic_inc(&frame_stream_generation);
+    k_spinlock_key_t key = k_spin_lock(&frame_stream_lease_lock);
+    frame_stream_lease_deadline = 0;
+    frame_stream_advance_generation_locked();
     atomic_clear(&frame_stream_active);
+    k_spin_unlock(&frame_stream_lease_lock, key);
     k_work_reschedule_for_queue(zmk_workqueue_lowprio_work_q(), &frame_stream_work, K_NO_WAIT);
 }
 
 static bool frame_stream_is_current(void) {
-    if (!atomic_get(&frame_stream_active) ||
-        frame_stream_session_generation != (uint32_t)atomic_get(&frame_stream_generation)) {
+    k_spinlock_key_t key = k_spin_lock(&frame_stream_lease_lock);
+    bool current =
+        atomic_get(&frame_stream_active) &&
+        frame_stream_session_generation == (uint32_t)atomic_get(&frame_stream_generation) &&
+        frame_stream_lease_deadline > k_uptime_get();
+    k_spin_unlock(&frame_stream_lease_lock, key);
+    if (!current) {
         return false;
     }
 #if !PMW3610_IS_SPLIT_PERIPHERAL
@@ -460,6 +543,8 @@ static void frame_stream_work_handler(struct k_work *work) {
      * previous per-iteration pmw3610_capture_frame() paid a full
      * power-up-reset + async re-init on every single frame. */
     struct pmw3610_frame_capture_result capture = {0};
+    /* A failing SPI transfer may already overwrite part of the shared buffer. */
+    frame_len = 0;
     int err = pmw3610_frame_capture_read(dev, &params, frame_buf, sizeof(frame_buf), &capture);
     if (err) {
         LOG_WRN("Frame stream: capture read failed: errno %d", err);
@@ -518,9 +603,17 @@ static void frame_stream_work_handler(struct k_work *work) {
 
 static void handle_set_frame_stream_request(const cormoran_pmw3610_SetFrameStreamRequest *req,
                                             cormoran_pmw3610_Response *resp) {
+    if (req->renew_only && (!req->enable || req->stream_epoch == 0)) {
+        set_error(resp, "SetFrameStream: renewal requires an enabled session and its epoch");
+        return;
+    }
     if (!req->enable) {
         pmw3610_request_stop_stream();
-    } else {
+    } else if (!frame_stream_try_renew(req)) {
+        if (req->renew_only) {
+            set_error(resp, "SetFrameStream: renewal session expired or changed; start explicitly");
+            return;
+        }
         if (k_mutex_lock(&frame_lock, K_NO_WAIT) != 0) {
             set_error(resp, "SetFrameStream: capture is busy; retry after it finishes");
             return;
@@ -540,12 +633,16 @@ static void handle_set_frame_stream_request(const cormoran_pmw3610_SetFrameStrea
                 k_mutex_unlock(&frame_lock);
                 return;
             }
+            frame_stream_renew_lease();
         } else {
             /* Starting a new session: begin() once (may take up to ~700ms
              * if the sensor was in a deep rest mode -- see
              * pmw3610_frame_capture_begin()'s docs), surfaced as an error
              * response on failure with streaming left off. */
-            uint32_t generation = (uint32_t)atomic_get(&frame_stream_generation);
+            k_spinlock_key_t key = k_spin_lock(&frame_stream_lease_lock);
+            uint32_t generation = frame_stream_advance_generation_locked();
+            frame_stream_lease_deadline = 0;
+            k_spin_unlock(&frame_stream_lease_lock, key);
             struct pmw3610_frame_capture_params params = {.pixel_count = pixels,
                                                           .max_invalid_retries = retries};
             int err = pmw3610_frame_capture_begin(dev, &params);
@@ -560,6 +657,7 @@ static void handle_set_frame_stream_request(const cormoran_pmw3610_SetFrameStrea
             frame_stream_session_generation = generation;
             frame_stream_session_active = true;
             atomic_set(&frame_stream_active, 1);
+            frame_stream_renew_lease();
             if (!frame_stream_is_current()) {
                 atomic_clear(&frame_stream_active);
                 frame_stream_end_session_if_needed();
@@ -575,7 +673,12 @@ static void handle_set_frame_stream_request(const cormoran_pmw3610_SetFrameStrea
 
     cormoran_pmw3610_SetFrameStreamResponse result =
         cormoran_pmw3610_SetFrameStreamResponse_init_zero;
-    result.streaming = atomic_get(&frame_stream_active) != 0;
+    k_spinlock_key_t key = k_spin_lock(&frame_stream_lease_lock);
+    result.streaming =
+        atomic_get(&frame_stream_active) != 0 && frame_stream_lease_deadline > k_uptime_get();
+    result.stream_epoch = result.streaming ? frame_stream_lease_generation : 0;
+    result.lease_ms = CONFIG_ZMK_PMW3610_FRAME_STREAM_LEASE_MS;
+    k_spin_unlock(&frame_stream_lease_lock, key);
 
     resp->which_response_type = cormoran_pmw3610_Response_set_frame_stream_tag;
     resp->response_type.set_frame_stream = result;
@@ -661,6 +764,7 @@ static void handle_capture_frame_request(const cormoran_pmw3610_CaptureFrameRequ
     };
 
     struct pmw3610_frame_capture_result capture = {0};
+    frame_len = 0;
     int err = pmw3610_capture_frame(dev, &params, frame_buf, sizeof(frame_buf), &capture);
     if (err) {
         set_error(resp, "CaptureFrame failed: errno %d", err);
@@ -684,7 +788,7 @@ static void handle_capture_frame_request(const cormoran_pmw3610_CaptureFrameRequ
 
 static void handle_get_frame_chunk_request(const cormoran_pmw3610_GetFrameChunkRequest *req,
                                            cormoran_pmw3610_Response *resp) {
-    if (frame_id == 0 || req->frame_id != frame_id) {
+    if (frame_id == 0 || frame_len == 0 || req->frame_id != frame_id) {
         set_error(resp, "frame_id %u not found (current frame_id %u)", (unsigned int)req->frame_id,
                   (unsigned int)frame_id);
         return;

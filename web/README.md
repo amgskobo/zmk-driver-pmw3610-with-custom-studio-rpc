@@ -214,10 +214,10 @@ device_index, pixel_count, max_invalid_retries}`, then the firmware
   renders every byte as-is and always reports 0 invalid bytes (the burst
   read is all-or-nothing -- see `complete`).
 
-## Roadmap
+## Validation scope
 
-This UI is feature-complete through Phase E (sensor info/diagnostics,
-settings, frame capture/streaming, Studio lock awareness). The frame-capture
-procedure has been hardware-validated (Phase D); Phase E's notification-based
-streaming path has likewise been hardware-validated (see the module
-README's "Frame capture" / "Security" sections and DESIGN.md).
+The UI supports sensor info/diagnostics, settings, frame capture/streaming and
+Studio lock awareness. The [owner test guide](../tests/README.md) describes
+the controlled firmware/codec/Web checks and their limits. Physical sensor
+capture, USB/BLE or split delivery, power and timing require separately
+authorized acceptance with matching source, configuration and artifacts.

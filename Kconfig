@@ -8,6 +8,7 @@
 menuconfig PMW3610
   bool "PMW3610 mouse optical sensor"
   select SPI
+  select ZMK_LOW_PRIORITY_WORK_QUEUE
   depends on INPUT
   depends on DT_HAS_CORMORAN_PMW3610_ENABLED
   help
@@ -54,7 +55,7 @@ config PMW3610_SMART_ALGORITHM
 config PMW3610_RUN_DOWNSHIFT_TIME_MS
     int "PMW3610's default RUN mode downshift time"
     default 128
-    range 13 3264
+    range 32 8160
     help
       Default RUN mode downshift down time in milliseconds.
       Time after which sensor goes from RUN to REST1 mode.
@@ -158,6 +159,18 @@ config ZMK_PMW3610_RELAY_QUEUE_DEPTH
       busy. The central has separate response and notification queues; the
       peripheral has a request queue. An incoming packet is dropped with a
       warning when its queue is full. Stream retirement bypasses these queues.
+
+config ZMK_PMW3610_FRAME_STREAM_LEASE_MS
+    int "Frame stream client lease (ms)"
+    depends on ZMK_PMW3610_PROTOBUF
+    default 15000
+    range 10000 120000
+    help
+      Stop a capture session when no identical SetFrameStream(enable=true)
+      renewal is received within this time. The Web viewer renews every two
+      seconds. Older clients must renew too; a disconnected or crashed client
+      cannot retain capture indefinitely. Sensor cleanup runs after any
+      in-flight capture or transport send returns.
 
 config ZMK_PMW3610_SPLIT_RPC_RELAY_TEST
     bool "Enable native_sim-only PMW3610 split relay test hooks"

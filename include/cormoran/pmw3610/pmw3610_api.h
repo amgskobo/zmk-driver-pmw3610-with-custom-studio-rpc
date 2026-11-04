@@ -251,9 +251,9 @@ int pmw3610_capture_frame(const struct device *dev,
 
 /** @brief Begin a persistent frame-capture session (no per-frame reset).
  *
- * Takes the device's internal lock just long enough to require `data->ready`
- * (else -EBUSY) and set an internal "capture active" flag, then disables the
- * motion IRQ and -- once for the whole session -- forces the sensor into run
+ * Takes the device's internal lock to require `data->ready` and no existing
+ * capture (else -EBUSY), set the "capture active" flag, disable the motion
+ * IRQ and -- once for the whole session -- force the sensor into run
  * mode (PERFORMANCE |= 0xF0) and confirms the mode switch landed (clear +
  * poll OBSERVATION1), which can take up to ~700ms if the sensor was in a
  * deep rest mode. This is the slow, one-time setup that

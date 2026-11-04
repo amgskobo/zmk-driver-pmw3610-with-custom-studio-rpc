@@ -7,7 +7,7 @@
 
 extern bool test_sensor_capturing[2];
 extern unsigned test_begin_calls[2], test_end_calls[2];
-extern bool test_cancel_begin, test_cancel_read;
+extern bool test_cancel_begin, test_cancel_read, test_fail_read;
 extern void (*test_begin_hook)(void);
 extern unsigned test_notification_count, test_response_count, test_request_count, test_stop_count;
 extern cormoran_pmw3610_Notification test_notifications[64];

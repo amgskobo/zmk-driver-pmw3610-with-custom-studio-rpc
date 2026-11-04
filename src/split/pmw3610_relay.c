@@ -521,7 +521,8 @@ static uint32_t send_relay_request(const cormoran_pmw3610_Request *req) {
     }
     event.size = (uint16_t)ostream.bytes_written;
 
-    if (req->which_request_type == cormoran_pmw3610_Request_set_frame_stream_tag) {
+    if (req->which_request_type == cormoran_pmw3610_Request_set_frame_stream_tag &&
+        !req->request_type.set_frame_stream.renew_only) {
         atomic_inc(&relay_stream_generation);
         k_msgq_purge(&relay_notification_queue);
         atomic_set(&relay_stream_enabled, req->request_type.set_frame_stream.enable);

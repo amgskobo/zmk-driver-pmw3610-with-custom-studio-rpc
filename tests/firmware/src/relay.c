@@ -182,6 +182,29 @@ ZTEST(relay, test_failed_stop_is_retried_and_new_start_retires_retry) {
     zassert_equal(test_stop_count, count);
 }
 
+ZTEST(relay, test_renewal_preserves_queued_frames_and_cannot_reopen_retired_forwarding) {
+    request(true);
+    uint32_t generation = (uint32_t)atomic_get(&relay_stream_generation);
+    test_block_queue();
+    struct zmk_pmw3610_relay_notification event = chunk(0);
+    on_pmw3610_relay_notification(&event);
+    cormoran_pmw3610_Request renewal = cormoran_pmw3610_Request_init_zero;
+    renewal.which_request_type = cormoran_pmw3610_Request_set_frame_stream_tag;
+    renewal.request_type.set_frame_stream.enable = true;
+    renewal.request_type.set_frame_stream.renew_only = true;
+    renewal.request_type.set_frame_stream.stream_epoch = 19;
+    zassert_not_equal(send_relay_request(&renewal), 0);
+    zassert_equal((uint32_t)atomic_get(&relay_stream_generation), generation);
+    zassert_equal(k_msgq_num_used_get(&relay_notification_queue), 1);
+    test_release_queue();
+    test_drain_queue();
+    zassert_equal(test_notification_count, 1);
+    pmw3610_relay_revoke_session();
+    zassert_false(atomic_get(&relay_stream_enabled));
+    zassert_not_equal(send_relay_request(&renewal), 0);
+    zassert_false(atomic_get(&relay_stream_enabled));
+}
+
 #else
 static struct zmk_pmw3610_relay_request request(uint32_t id, bool stream) {
     cormoran_pmw3610_RelayRequest request = cormoran_pmw3610_RelayRequest_init_zero;

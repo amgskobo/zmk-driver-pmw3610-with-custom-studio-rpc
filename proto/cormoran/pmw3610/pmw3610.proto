@@ -211,11 +211,18 @@ message SetFrameStreamRequest {
     uint32 max_invalid_retries = 4;
     // See GetInfoRequest.source.
     uint32 source = 5;
+    // A renewal must never start a new session. Set this only with enable=true
+    // and the nonzero stream_epoch returned by the original start response.
+    bool renew_only = 6;
+    uint32 stream_epoch = 7;
 }
 
 message SetFrameStreamResponse {
     // Streaming state after applying this request.
     bool streaming = 1;
+    // Nonzero while streaming; changes for each new start or retirement.
+    uint32 stream_epoch = 2;
+    uint32 lease_ms = 3;
 }
 
 message Request {
