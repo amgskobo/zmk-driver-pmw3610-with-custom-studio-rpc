@@ -6,6 +6,6 @@ manifest:
   projects:
     - name: zmk-feature-custom-settings
       url: https://github.com/amgskobo/zmk-feature-custom-settings
-      revision: c4071b095c3007d1deb055c609603ca9b5897d14
+      revision: c38ce14beb07ecebc266c809870a3540942cdb24
       userdata:
         review-branch: codex/custom-settings-review
